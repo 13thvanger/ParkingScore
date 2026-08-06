@@ -1,0 +1,23 @@
+services:
+  parking-score:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      CRITERIA_FILE: /app/criteria.txt
+      STATE_DB: /data/parking_score.db
+      CACHE_DIR: /data/cache
+    volumes:
+      - ./criteria.txt:/app/criteria.txt:ro
+      - parking-score-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-m", "parking_score", "healthcheck"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  parking-score-data:
