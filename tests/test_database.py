@@ -97,3 +97,27 @@ def test_incomplete_series_cannot_select_best(tmp_path) -> None:
         assert "best=false" in updates[0].content
     finally:
         repository.close()
+
+
+def test_new_jobs_are_ordered_by_capture_time(tmp_path) -> None:
+    repository = Repository(tmp_path / "state.db")
+    discovered = datetime(2026, 8, 7, tzinfo=UTC)
+    try:
+        newer = _add(
+            repository,
+            "newer",
+            datetime(2026, 8, 6, tzinfo=UTC),
+            discovered - timedelta(minutes=10),
+        )
+        older = _add(
+            repository,
+            "older",
+            datetime(2026, 7, 1, tzinfo=UTC),
+            discovered,
+        )
+
+        jobs = repository.next_new_jobs("criteria-v1", discovered, limit=10)
+
+        assert [job.id for job in jobs] == [older, newer]
+    finally:
+        repository.close()

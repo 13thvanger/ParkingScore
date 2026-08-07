@@ -50,8 +50,8 @@ class ParkingScoreService:
 
         discovered = self._discover()
         self.repository.rebuild_series(self.settings.series_window_minutes)
-        processed, mode = self._process_jobs(criteria)
-        published = self._publish_outputs(criteria)
+        processed, mode, published = self._process_jobs(criteria)
+        published += self._publish_outputs(criteria)
         self._heartbeat()
 
         statistics = self.repository.statistics(criteria.content_hash)
@@ -71,9 +71,15 @@ class ParkingScoreService:
     def _discover(self) -> int:
         discovered = 0
         with self.ftp_factory(self.settings) as ftp:
+            logger.info(
+                "FTP scan started root=%s recursive=%s",
+                self.settings.ftp_root_dir,
+                self.settings.ftp_recursive,
+            )
             files = ftp.list_files(
                 self.settings.ftp_root_dir, self.settings.ftp_recursive
             )
+            logger.info("FTP listing complete files=%d", len(files))
             stable_counts = self.repository.update_remote_files(files)
             stable_files = [
                 item
@@ -81,7 +87,8 @@ class ParkingScoreService:
                 if stable_counts.get(item.path, 0) >= self.settings.ftp_stable_polls
             ]
             pairs = build_pairs(stable_files, self.settings.image_extensions)
-            for pair in pairs:
+            logger.info("FTP stable pairs found=%d", len(pairs))
+            for index, pair in enumerate(pairs, start=1):
                 if not self.repository.pair_needs_ingest(pair):
                     continue
                 try:
@@ -103,9 +110,16 @@ class ParkingScoreService:
                         pair.image.path,
                         pair.xml.path,
                     )
+                if index % 500 == 0:
+                    logger.info(
+                        "FTP metadata progress checked=%d/%d discovered=%d",
+                        index,
+                        len(pairs),
+                        discovered,
+                    )
         return discovered
 
-    def _process_jobs(self, criteria: CriteriaSet) -> tuple[int, str]:
+    def _process_jobs(self, criteria: CriteriaSet) -> tuple[int, str, int]:
         now = utc_now()
         if self.repository.has_pending_new(criteria.content_hash):
             jobs = self.repository.next_new_jobs(
@@ -123,6 +137,7 @@ class ParkingScoreService:
             mode = "reprocess" if jobs else "idle"
 
         processed = 0
+        published = 0
         for observation in jobs:
             try:
                 self._ensure_cached_image(observation)
@@ -138,6 +153,7 @@ class ParkingScoreService:
                     observation.id, criteria.content_hash, assessment
                 )
                 processed += 1
+                published += self._publish_outputs(criteria)
                 logger.info(
                     "Image assessed path=%s probability=%d mode=%s",
                     observation.image_path,
@@ -159,7 +175,7 @@ class ParkingScoreService:
                 )
             finally:
                 self._heartbeat()
-        return processed, mode
+        return processed, mode, published
 
     def _ensure_cached_image(self, observation: Observation) -> None:
         if observation.cache_image_path.exists():
@@ -184,6 +200,7 @@ class ParkingScoreService:
                         update.observation_id, update.content
                     )
                     published += 1
+                    logger.info("Result published path=%s", update.remote_path)
                 except Exception:
                     logger.exception(
                         "Cannot publish result path=%s", update.remote_path

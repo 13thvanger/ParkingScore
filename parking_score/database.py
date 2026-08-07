@@ -314,7 +314,7 @@ class Repository:
             WHERE (needs_new_assessment=1 OR probability IS NULL)
               AND (failed_criteria_hash IS NULL OR failed_criteria_hash <> ?)
               AND (retry_after IS NULL OR retry_after <= ?)
-            ORDER BY discovered_at, captured_at, image_path
+            ORDER BY captured_at, discovered_at, image_path
             LIMIT ?
             """,
             (criteria_hash, to_iso(now), limit),
@@ -332,7 +332,7 @@ class Repository:
               AND (criteria_hash IS NULL OR criteria_hash <> ?)
               AND (failed_criteria_hash IS NULL OR failed_criteria_hash <> ?)
               AND (retry_after IS NULL OR retry_after <= ?)
-            ORDER BY series_id, captured_at, image_path
+            ORDER BY captured_at, discovered_at, image_path
             LIMIT ?
             """,
             (criteria_hash, criteria_hash, to_iso(now), limit),

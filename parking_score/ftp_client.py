@@ -4,6 +4,7 @@ import ftplib
 import io
 import logging
 import posixpath
+import re
 import uuid
 from collections import defaultdict
 from collections.abc import Iterable
@@ -14,6 +15,14 @@ from .config import Settings
 from .models import RemoteFile, RemotePair
 
 logger = logging.getLogger(__name__)
+
+_UNIX_LIST_LINE = re.compile(
+    r"^(?P<kind>[bcdlps-])(?P<permissions>[^\s]{9})[.+@]?\s+"
+    r"(?P<links>\d+)\s+(?P<owner>\S+)\s+(?P<group>\S+)\s+"
+    r"(?P<size>\d+)\s+(?P<month>[A-Za-z]{3})\s+"
+    r"(?P<day>\d{1,2})\s+(?P<when>\d{2}:\d{2}|\d{4})\s+"
+    r"(?P<name>.+)$"
+)
 
 
 def _remote_join(directory: str, name: str) -> str:
@@ -56,6 +65,25 @@ def build_pairs(
                 len(xml_matches),
             )
     return pairs
+
+
+def parse_unix_list_line(line: str) -> tuple[str, dict[str, str]] | None:
+    match = _UNIX_LIST_LINE.match(line)
+    if match is None:
+        return None
+    kind = match.group("kind")
+    entry_type = {"-": "file", "d": "dir", "l": "link"}.get(kind, "other")
+    return (
+        match.group("name"),
+        {
+            "type": entry_type,
+            "size": match.group("size"),
+            "modify": (
+                f"LIST:{match.group('month')}:{match.group('day')}:"
+                f"{match.group('when')}"
+            ),
+        },
+    )
 
 
 class FtpClient:
@@ -134,8 +162,28 @@ class FtpClient:
         try:
             return list(ftp.mlsd(directory, facts=["type", "size", "modify"]))
         except (ftplib.error_perm, ftplib.error_temp, AttributeError) as exc:
-            logger.debug("MLSD failed for %s, using NLST: %s", directory, exc)
+            logger.debug("MLSD failed for %s, trying LIST: %s", directory, exc)
+        try:
+            return self._list_directory_list(ftp, directory)
+        except (ftplib.Error, ValueError) as exc:
+            logger.debug("LIST failed for %s, using NLST: %s", directory, exc)
             return self._list_directory_nlst(ftp, directory)
+
+    @staticmethod
+    def _list_directory_list(
+        ftp: ftplib.FTP, directory: str
+    ) -> list[tuple[str, dict[str, str]]]:
+        lines: list[str] = []
+        ftp.retrlines(f"LIST {directory}", lines.append)
+        entries: list[tuple[str, dict[str, str]]] = []
+        for line in lines:
+            if line.casefold().startswith("total "):
+                continue
+            parsed = parse_unix_list_line(line)
+            if parsed is None:
+                raise ValueError(f"Unsupported FTP LIST line: {line[:200]}")
+            entries.append(parsed)
+        return entries
 
     def _list_directory_nlst(
         self, ftp: ftplib.FTP, directory: str
