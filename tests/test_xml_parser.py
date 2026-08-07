@@ -33,3 +33,24 @@ def test_parse_recognition_xml() -> None:
 
 def test_normalize_visually_equivalent_cyrillic_plate() -> None:
     assert normalize_plate("о 716 мр 48") == "O716MP48"
+
+
+def test_camera_falls_back_to_serial_number_and_position() -> None:
+    xml = SAMPLE_XML.replace(
+        b"<CameraSerialNumber>02DB0494178</CameraSerialNumber>",
+        b"<SerialNumber>01-AA530</SerialNumber><PositionCamera>1</PositionCamera>",
+    )
+
+    metadata = parse_recognition_xml(xml, fallback_camera="/DozorMA687")
+
+    assert metadata.camera == "01-AA530/position-1"
+
+
+def test_camera_falls_back_to_ftp_directory() -> None:
+    xml = SAMPLE_XML.replace(
+        b"<CameraSerialNumber>02DB0494178</CameraSerialNumber>", b""
+    )
+
+    metadata = parse_recognition_xml(xml, fallback_camera="/DozorMA687")
+
+    assert metadata.camera == "ftp:/DozorMA687"

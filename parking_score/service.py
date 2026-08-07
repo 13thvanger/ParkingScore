@@ -86,7 +86,10 @@ class ParkingScoreService:
                     continue
                 try:
                     xml_data = ftp.download_bytes(pair.xml.path)
-                    metadata = parse_recognition_xml(xml_data)
+                    metadata = parse_recognition_xml(
+                        xml_data,
+                        fallback_camera=str(PurePosixPath(pair.image.path).parent),
+                    )
                     local_path = self._cache_path(pair.image.path)
                     local_path.unlink(missing_ok=True)
                     _, changed = self.repository.upsert_observation(

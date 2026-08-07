@@ -85,7 +85,9 @@ def _parse_datetime(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
-def parse_recognition_xml(data: bytes) -> PhotoMetadata:
+def parse_recognition_xml(
+    data: bytes, fallback_camera: str | None = None
+) -> PhotoMetadata:
     try:
         root = ET.fromstring(data)
     except ET.ParseError as exc:
@@ -107,7 +109,23 @@ def parse_recognition_xml(data: bytes) -> PhotoMetadata:
         except ValueError as exc:
             raise MetadataError("Invalid fallback coordinates") from exc
 
-    camera = _text(root, "CameraSerialNumber", required=True)
+    camera = _text(root, "CameraSerialNumber")
+    if not camera:
+        serial_number = _text(root, "SerialNumber")
+        position_camera = _text(root, "PositionCamera")
+        if serial_number:
+            camera = (
+                f"{serial_number}/position-{position_camera}"
+                if position_camera
+                else serial_number
+            )
+        elif fallback_camera and fallback_camera.strip():
+            camera = f"ftp:{fallback_camera.strip()}"
+        else:
+            raise MetadataError(
+                "Missing camera identifier: CameraSerialNumber, SerialNumber "
+                "and FTP directory are unavailable"
+            )
     width = _optional_int(root, "ImagesInfo", "ImageWidth")
     height = _optional_int(root, "ImagesInfo", "ImageHeight")
 

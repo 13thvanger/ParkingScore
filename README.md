@@ -27,6 +27,8 @@ best=false
    - `CaptureInfo/Date` — время снимка;
    - `Address` — место (при отсутствии используются координаты);
    - `CameraSerialNumber` — камера;
+   - если `CameraSerialNumber` отсутствует, камера определяется по
+     `SerialNumber + PositionCamera`, затем по имени FTP-каталога;
    - `ImagesInfo/Position` — координаты номера целевого автомобиля.
 5. Серия строится по `ГРЗ + место + камера`. Следующий снимок входит в серию,
    если интервал от предыдущего не больше `SERIES_WINDOW_MINUTES`.
