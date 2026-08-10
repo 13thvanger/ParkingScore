@@ -159,3 +159,55 @@ def test_progress_snapshot_uses_current_criteria(tmp_path) -> None:
         )
     finally:
         repository.close()
+
+
+def test_transient_failure_is_not_exhausted(tmp_path) -> None:
+    repository = Repository(tmp_path / "state.db")
+    started = datetime(2026, 8, 1, tzinfo=UTC)
+    try:
+        observation_id = _add(repository, "retry", started, started)
+
+        exhausted = repository.record_failure(
+            observation_id,
+            "criteria-v1",
+            "AI request failed after retries: HTTP 429",
+            max_attempts=1,
+            retry_base_seconds=30,
+            now=started,
+            allow_exhaustion=False,
+        )
+        row = repository.connection.execute(
+            "SELECT * FROM observations WHERE id=?", (observation_id,)
+        ).fetchone()
+
+        assert not exhausted
+        assert row["failed_criteria_hash"] is None
+        assert row["retry_after"] is not None
+        assert row["needs_new_assessment"] == 1
+    finally:
+        repository.close()
+
+
+def test_legacy_transient_failure_is_requeued(tmp_path) -> None:
+    repository = Repository(tmp_path / "state.db")
+    started = datetime(2026, 8, 1, tzinfo=UTC)
+    try:
+        observation_id = _add(repository, "legacy", started, started)
+        repository.record_failure(
+            observation_id,
+            "criteria-v1",
+            "AI request failed after retries: timeout",
+            max_attempts=1,
+            retry_base_seconds=30,
+            now=started,
+        )
+
+        assert repository.release_legacy_transient_ai_failures("criteria-v1") == 1
+        row = repository.connection.execute(
+            "SELECT * FROM observations WHERE id=?", (observation_id,)
+        ).fetchone()
+        assert row["failed_criteria_hash"] is None
+        assert row["retry_after"] is None
+        assert row["attempt_count"] == 0
+    finally:
+        repository.close()

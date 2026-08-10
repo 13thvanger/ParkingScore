@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import random
+import threading
 import time
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -17,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 class AIError(RuntimeError):
     """Raised when the AI service cannot produce a valid assessment."""
+
+
+class AITransientError(AIError):
+    """Raised when an assessment should be retried without permanent failure."""
 
 
 def _extract_json_object(content: str) -> dict[str, Any]:
@@ -66,11 +74,72 @@ def parse_assessment(content: str) -> Assessment:
     )
 
 
+def _message_text(body: Any) -> str:
+    try:
+        choice = body["choices"][0]
+        message = choice["message"]
+        content = message.get("content")
+    except (AttributeError, KeyError, IndexError, TypeError) as exc:
+        raise AIError("AI response does not contain choices[0].message") from exc
+
+    if isinstance(content, str):
+        return content
+
+    parts: list[str] = []
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+                continue
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    elif isinstance(content, dict):
+        text = content.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+    joined = "\n".join(part for part in parts if part.strip())
+    if joined:
+        return joined
+
+    tool_calls = message.get("tool_calls")
+    tool_call_count = len(tool_calls) if isinstance(tool_calls, list) else 0
+    raise AIError(
+        "AI response message content is not usable "
+        f"(content_type={type(content).__name__}, "
+        f"finish_reason={choice.get('finish_reason')!r}, "
+        f"refusal={bool(message.get('refusal'))}, "
+        f"tool_calls={tool_call_count}, "
+        f"reasoning={isinstance(message.get('reasoning'), str)})"
+    )
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    value = response.headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        return max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
+
+
 class AIClient:
     def __init__(
         self, settings: Settings, transport: httpx.BaseTransport | None = None
     ) -> None:
         self.settings = settings
+        self._request_gate_lock = threading.Lock()
+        self._next_request_at = 0.0
+        self._cooldown_until = 0.0
         self.client = httpx.Client(
             timeout=settings.ai_timeout_seconds,
             transport=transport,
@@ -97,6 +166,7 @@ class AIClient:
         last_error: Exception | None = None
         for attempt in range(1, self.settings.ai_request_retries + 1):
             try:
+                self._wait_for_request_slot()
                 response = self.client.post(self.settings.ai_api_url, json=payload)
                 if response.status_code not in {200, 201}:
                     message = response.text[:500]
@@ -108,11 +178,13 @@ class AIClient:
                         and response.status_code < 500
                     ):
                         raise _FatalAIError(message_text)
-                    raise _RetryableAIError(message_text)
+                    raise _RetryableAIError(
+                        message_text,
+                        retry_after_seconds=_retry_after_seconds(response),
+                        global_cooldown=response.status_code == 429,
+                    )
                 body = response.json()
-                content = body["choices"][0]["message"]["content"]
-                if not isinstance(content, str):
-                    raise AIError("AI response message content is not text")
+                content = _message_text(body)
                 return parse_assessment(content)
             except _FatalAIError as exc:
                 raise AIError(str(exc)) from exc
@@ -126,16 +198,49 @@ class AIClient:
                 last_error = exc
                 if attempt >= self.settings.ai_request_retries:
                     break
-                delay = min(2 ** (attempt - 1), 8)
+                delay = self._retry_delay(attempt, exc)
+                if isinstance(exc, _RetryableAIError) and exc.global_cooldown:
+                    self._extend_global_cooldown(delay)
                 logger.warning(
-                    "AI request attempt %d/%d failed; retrying in %ds: %s",
+                    "AI request attempt %d/%d failed; retrying in %.1fs: %s",
                     attempt,
                     self.settings.ai_request_retries,
                     delay,
                     exc,
                 )
                 time.sleep(delay)
-        raise AIError(f"AI request failed after retries: {last_error}")
+        raise AITransientError(f"AI request failed after retries: {last_error}")
+
+    def _wait_for_request_slot(self) -> None:
+        requests_per_minute = self.settings.ai_requests_per_minute
+        interval = 60.0 / requests_per_minute if requests_per_minute else 0.0
+        while True:
+            with self._request_gate_lock:
+                now = time.monotonic()
+                ready_at = max(self._next_request_at, self._cooldown_until)
+                if now >= ready_at:
+                    self._next_request_at = now + interval
+                    return
+                delay = ready_at - now
+            time.sleep(delay)
+
+    def _extend_global_cooldown(self, delay: float) -> None:
+        with self._request_gate_lock:
+            self._cooldown_until = max(
+                self._cooldown_until, time.monotonic() + delay
+            )
+
+    def _retry_delay(self, attempt: int, error: Exception) -> float:
+        delay = min(
+            self.settings.ai_retry_base_seconds * (2 ** (attempt - 1)),
+            self.settings.ai_retry_max_seconds,
+        )
+        if isinstance(error, _RetryableAIError):
+            retry_after = error.retry_after_seconds
+            if retry_after is not None:
+                delay = max(delay, retry_after)
+        delay += random.uniform(0.0, self.settings.ai_retry_jitter_seconds)
+        return min(delay, self.settings.ai_retry_max_seconds)
 
     def _payload(
         self,
@@ -202,7 +307,15 @@ class AIClient:
 
 
 class _RetryableAIError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        retry_after_seconds: float | None = None,
+        global_cooldown: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+        self.global_cooldown = global_cooldown
 
 
 class _FatalAIError(RuntimeError):

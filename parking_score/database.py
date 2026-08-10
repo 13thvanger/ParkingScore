@@ -391,6 +391,7 @@ class Repository:
         max_attempts: int,
         retry_base_seconds: int,
         now: datetime | None = None,
+        allow_exhaustion: bool = True,
     ) -> bool:
         """Record a processing failure and return True when retries are exhausted."""
         now = now or utc_now()
@@ -408,7 +409,7 @@ class Repository:
             if row["attempt_criteria_hash"] == criteria_hash
             else 1
         )
-        exhausted = attempts >= max_attempts
+        exhausted = allow_exhaustion and attempts >= max_attempts
         delay = retry_base_seconds * (2 ** min(attempts - 1, 6))
         retry_after = now + timedelta(seconds=delay)
         with self.connection:
@@ -430,6 +431,23 @@ class Repository:
                 ),
             )
         return exhausted
+
+    def release_legacy_transient_ai_failures(self, criteria_hash: str) -> int:
+        """Requeue AI failures saved before transient errors were distinguished."""
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE observations SET
+                    attempt_count=0,
+                    attempt_criteria_hash=NULL,
+                    retry_after=NULL,
+                    failed_criteria_hash=NULL
+                WHERE failed_criteria_hash=?
+                  AND last_error LIKE 'AI request failed after retries:%'
+                """,
+                (criteria_hash,),
+            )
+        return int(cursor.rowcount)
 
     def output_updates(
         self,

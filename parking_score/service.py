@@ -8,7 +8,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
-from .ai_client import AIClient
+from .ai_client import AIClient, AITransientError
 from .config import Settings
 from .criteria import CriteriaSet, load_criteria
 from .database import Repository, to_iso, utc_now
@@ -48,6 +48,11 @@ class ParkingScoreService:
                 "Criteria changed; existing assessments queued for background refresh"
             )
         self.repository.set_meta("criteria_hash", criteria.content_hash)
+        released = self.repository.release_legacy_transient_ai_failures(
+            criteria.content_hash
+        )
+        if released:
+            logger.info("Legacy transient AI failures requeued count=%d", released)
 
         discovered, ftp_total_pairs, ftp_stable_pairs = self._discover()
         self.repository.rebuild_series(self.settings.series_window_minutes)
@@ -239,13 +244,22 @@ class ParkingScoreService:
     def _record_processing_failure(
         self, observation: Observation, criteria: CriteriaSet, error: Exception
     ) -> None:
+        transient = isinstance(error, AITransientError)
         exhausted = self.repository.record_failure(
             observation.id,
             criteria.content_hash,
             str(error),
             self.settings.max_processing_attempts,
             self.settings.retry_base_seconds,
+            allow_exhaustion=not transient,
         )
+        if transient:
+            logger.warning(
+                "Image assessment deferred path=%s transient=true error=%s",
+                observation.image_path,
+                error,
+            )
+            return
         logger.exception(
             "Image assessment failed path=%s exhausted=%s",
             observation.image_path,

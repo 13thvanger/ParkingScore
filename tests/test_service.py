@@ -9,6 +9,7 @@ from typing import Self
 
 from PIL import Image
 
+from parking_score.ai_client import AITransientError
 from parking_score.config import Settings
 from parking_score.database import to_iso, utc_now
 from parking_score.models import Assessment, RemoteFile
@@ -79,6 +80,12 @@ class ConcurrentFakeAI(FakeAI):
         finally:
             with self._lock:
                 self._active -= 1
+
+
+class TransientFakeAI(FakeAI):
+    def assess(self, observation, criteria, image) -> Assessment:
+        self.calls += 1
+        raise AITransientError("temporary AI response")
 
 
 def _jpeg() -> bytes:
@@ -195,5 +202,40 @@ def test_cycle_assesses_images_concurrently(tmp_path) -> None:
         assert fake_ai.max_active == 2
         assert "/root/photo-1.txt" in fake_ftp.uploaded
         assert "/root/photo-2.txt" in fake_ftp.uploaded
+    finally:
+        service.close()
+
+
+def test_transient_ai_error_stays_in_queue(tmp_path) -> None:
+    criteria_path = tmp_path / "criteria.txt"
+    criteria_path.write_text("criterion one\n", encoding="utf-8")
+    settings = Settings(
+        ftp_host="example",
+        ftp_port=21,
+        ftp_user="user",
+        ftp_password="password",
+        ftp_root_dir="/root",
+        ftp_stable_polls=1,
+        max_processing_attempts=1,
+        ai_api_key="key",
+        criteria_file=criteria_path,
+        state_db=tmp_path / "state.db",
+        cache_dir=tmp_path / "cache",
+    )
+    fake_ftp = FakeFtp(_xml(), _jpeg())
+    service = ParkingScoreService(
+        settings,
+        ai_client=TransientFakeAI(),
+        ftp_factory=lambda unused: fake_ftp,
+    )
+    try:
+        service.run_cycle()
+        row = service.repository.connection.execute(
+            "SELECT * FROM observations LIMIT 1"
+        ).fetchone()
+
+        assert row["failed_criteria_hash"] is None
+        assert row["retry_after"] is not None
+        assert row["needs_new_assessment"] == 1
     finally:
         service.close()

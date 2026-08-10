@@ -76,6 +76,10 @@ class Settings:
     ai_timeout_seconds: float = 120.0
     ai_request_retries: int = 3
     ai_worker_threads: int = 4
+    ai_requests_per_minute: int = 6
+    ai_retry_base_seconds: float = 10.0
+    ai_retry_max_seconds: float = 120.0
+    ai_retry_jitter_seconds: float = 3.0
     ai_temperature: float = 0.0
     ai_max_tokens: int = 1000
     ai_image_max_dimension: int = 1920
@@ -110,6 +114,12 @@ class Settings:
         quality = _integer("AI_IMAGE_JPEG_QUALITY", 88)
         if quality > 95:
             raise ConfigurationError("AI_IMAGE_JPEG_QUALITY must be <= 95")
+        ai_retry_base_seconds = _floating("AI_RETRY_BASE_SECONDS", 10.0)
+        ai_retry_max_seconds = _floating("AI_RETRY_MAX_SECONDS", 120.0)
+        if ai_retry_max_seconds < ai_retry_base_seconds:
+            raise ConfigurationError(
+                "AI_RETRY_MAX_SECONDS must be >= AI_RETRY_BASE_SECONDS"
+            )
 
         return cls(
             ftp_host=_required("FTP_HOST"),
@@ -140,6 +150,10 @@ class Settings:
             ai_timeout_seconds=_floating("AI_TIMEOUT_SECONDS", 120.0, 1.0),
             ai_request_retries=_integer("AI_REQUEST_RETRIES", 3),
             ai_worker_threads=_integer("AI_WORKER_THREADS", 4),
+            ai_requests_per_minute=_integer("AI_REQUESTS_PER_MINUTE", 6, 0),
+            ai_retry_base_seconds=ai_retry_base_seconds,
+            ai_retry_max_seconds=ai_retry_max_seconds,
+            ai_retry_jitter_seconds=_floating("AI_RETRY_JITTER_SECONDS", 3.0),
             ai_temperature=_floating("AI_TEMPERATURE", 0.0),
             ai_max_tokens=_integer("AI_MAX_TOKENS", 1000),
             ai_image_max_dimension=_integer("AI_IMAGE_MAX_DIMENSION", 1920, 320),
