@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -209,5 +210,42 @@ def test_legacy_transient_failure_is_requeued(tmp_path) -> None:
         assert row["failed_criteria_hash"] is None
         assert row["retry_after"] is None
         assert row["attempt_count"] == 0
+    finally:
+        repository.close()
+
+
+def test_existing_database_gets_eligible_column(tmp_path) -> None:
+    db_path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        """
+        CREATE TABLE observations (
+            id INTEGER PRIMARY KEY,
+            series_id TEXT,
+            captured_at TEXT NOT NULL,
+            needs_new_assessment INTEGER NOT NULL DEFAULT 1,
+            criteria_hash TEXT,
+            retry_after TEXT
+        );
+        INSERT INTO observations (id, captured_at)
+        VALUES (1, '2026-08-01T00:00:00+00:00');
+        """
+    )
+    connection.close()
+
+    repository = Repository(db_path)
+    try:
+        columns = {
+            row["name"]
+            for row in repository.connection.execute(
+                "PRAGMA table_info(observations)"
+            )
+        }
+        row = repository.connection.execute(
+            "SELECT eligible FROM observations WHERE id=1"
+        ).fetchone()
+
+        assert "eligible" in columns
+        assert row["eligible"] == 0
     finally:
         repository.close()

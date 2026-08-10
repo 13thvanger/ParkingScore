@@ -15,7 +15,7 @@ from .database import Repository, to_iso, utc_now
 from .ftp_client import FtpClient, build_pairs
 from .image_processor import prepare_image
 from .models import Assessment, Observation
-from .xml_parser import parse_recognition_xml
+from .xml_parser import extract_pdop, has_required_pdop, parse_recognition_xml
 
 logger = logging.getLogger(__name__)
 
@@ -102,20 +102,40 @@ class ParkingScoreService:
                 len(available_pairs),
                 len(pairs),
             )
+            eligible_pairs = 0
+            excluded_pairs = 0
             for index, pair in enumerate(pairs, start=1):
-                if not self.repository.pair_needs_ingest(pair):
+                eligibility = self.repository.pair_filter_eligibility(pair)
+                if eligibility is not None:
+                    if eligibility:
+                        eligible_pairs += 1
+                    else:
+                        excluded_pairs += 1
                     continue
+                self.repository.deactivate_observation(pair.image.path)
                 try:
                     xml_data = ftp.download_bytes(pair.xml.path)
+                    pdop = extract_pdop(xml_data)
+                    if not has_required_pdop(pdop):
+                        self.repository.record_pair_filter(
+                            pair, pdop, eligible=False
+                        )
+                        excluded_pairs += 1
+                        continue
                     metadata = parse_recognition_xml(
                         xml_data,
                         fallback_camera=str(PurePosixPath(pair.image.path).parent),
                     )
                     local_path = self._cache_path(pair.image.path)
-                    local_path.unlink(missing_ok=True)
                     _, changed = self.repository.upsert_observation(
                         pair, metadata, local_path
                     )
+                    if changed:
+                        local_path.unlink(missing_ok=True)
+                    self.repository.record_pair_filter(
+                        pair, metadata.pdop, eligible=True
+                    )
+                    eligible_pairs += 1
                     if changed:
                         discovered += 1
                 except Exception:
@@ -131,7 +151,13 @@ class ParkingScoreService:
                         len(pairs),
                         discovered,
                     )
-        return discovered, len(available_pairs), len(pairs)
+            logger.info(
+                "FTP Pdop filter complete eligible=%d excluded=%d unchecked=%d",
+                eligible_pairs,
+                excluded_pairs,
+                len(pairs) - eligible_pairs - excluded_pairs,
+            )
+        return discovered, eligible_pairs, len(pairs)
 
     def _process_jobs(self, criteria: CriteriaSet) -> tuple[int, str, int]:
         now = utc_now()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 
 from .models import PhotoMetadata, PlateBox
 
@@ -38,6 +39,24 @@ def normalize_plate(value: str) -> str:
 
 def normalize_text(value: str) -> str:
     return " ".join(value.replace("Ё", "Е").replace("ё", "е").split()).casefold()
+
+
+def has_required_pdop(value: str | None) -> bool:
+    if value is None:
+        return False
+    try:
+        parsed = Decimal(value.strip())
+    except InvalidOperation:
+        return False
+    return parsed.is_finite() and parsed == Decimal("1.1")
+
+
+def extract_pdop(data: bytes) -> str | None:
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as exc:
+        raise MetadataError(f"Invalid XML: {exc}") from exc
+    return _text(root, "Coordinates", "Pdop") or None
 
 
 def _local_name(tag: str) -> str:
@@ -100,6 +119,7 @@ def parse_recognition_xml(
         raise MetadataError("CaptureInfo/Number does not contain a valid plate")
 
     captured_at = _parse_datetime(_text(root, "CaptureInfo", "Date", required=True))
+    pdop = _text(root, "Coordinates", "Pdop") or None
     place = _text(root, "Address")
     if not place:
         latitude = _text(root, "Coordinates", "Latitude", required=True)
@@ -150,4 +170,5 @@ def parse_recognition_xml(
         image_height=height,
         plate_box=plate_box,
         group_key=group_key,
+        pdop=pdop,
     )

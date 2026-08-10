@@ -85,6 +85,7 @@ class Repository:
                 group_key TEXT NOT NULL,
                 series_id TEXT,
                 cache_image_path TEXT NOT NULL,
+                eligible INTEGER NOT NULL DEFAULT 0,
                 probability INTEGER,
                 criteria_details TEXT,
                 comment TEXT,
@@ -105,6 +106,14 @@ class Repository:
             CREATE INDEX IF NOT EXISTS idx_observations_work
                 ON observations(needs_new_assessment, criteria_hash, retry_after);
 
+            CREATE TABLE IF NOT EXISTS pair_filters (
+                image_path TEXT PRIMARY KEY,
+                pair_signature TEXT NOT NULL,
+                pdop TEXT,
+                eligible INTEGER NOT NULL,
+                checked_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -124,6 +133,21 @@ class Repository:
 
             CREATE INDEX IF NOT EXISTS idx_progress_snapshots_recorded
                 ON progress_snapshots(recorded_at);
+            """
+        )
+        columns = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(observations)")
+        }
+        if "eligible" not in columns:
+            self.connection.execute(
+                "ALTER TABLE observations "
+                "ADD COLUMN eligible INTEGER NOT NULL DEFAULT 0"
+            )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_observations_eligible_work
+            ON observations(eligible, needs_new_assessment, criteria_hash, retry_after)
             """
         )
         self.connection.commit()
@@ -175,12 +199,67 @@ class Repository:
                 )
         return stable
 
-    def pair_needs_ingest(self, pair: RemotePair) -> bool:
+    def pair_filter_eligibility(self, pair: RemotePair) -> bool | None:
         row = self.connection.execute(
-            "SELECT pair_signature FROM observations WHERE image_path = ?",
+            """
+            SELECT pair_signature, eligible
+            FROM pair_filters
+            WHERE image_path=?
+            """,
             (pair.image.path,),
         ).fetchone()
-        return row is None or row["pair_signature"] != pair.signature
+        if row is None or row["pair_signature"] != pair.signature:
+            return None
+        return bool(row["eligible"])
+
+    def record_pair_filter(
+        self,
+        pair: RemotePair,
+        pdop: str | None,
+        eligible: bool,
+        now: datetime | None = None,
+    ) -> None:
+        now = now or utc_now()
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO pair_filters (
+                    image_path, pair_signature, pdop, eligible, checked_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(image_path) DO UPDATE SET
+                    pair_signature=excluded.pair_signature,
+                    pdop=excluded.pdop,
+                    eligible=excluded.eligible,
+                    checked_at=excluded.checked_at
+                """,
+                (
+                    pair.image.path,
+                    pair.signature,
+                    pdop,
+                    int(eligible),
+                    to_iso(now),
+                ),
+            )
+            if not eligible:
+                self.connection.execute(
+                    """
+                    UPDATE observations
+                    SET eligible=0, series_id=NULL
+                    WHERE image_path=?
+                    """,
+                    (pair.image.path,),
+                )
+
+    def deactivate_observation(self, image_path: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE observations
+                SET eligible=0, series_id=NULL
+                WHERE image_path=?
+                """,
+                (image_path,),
+            )
 
     def upsert_observation(
         self,
@@ -196,7 +275,11 @@ class Repository:
         stem = Path(pair.image.path).stem
         box = metadata.plate_box
         existing = self.connection.execute(
-            "SELECT id, pair_signature FROM observations WHERE image_path = ?",
+            """
+            SELECT id, pair_signature, eligible
+            FROM observations
+            WHERE image_path=?
+            """,
             (pair.image.path,),
         ).fetchone()
 
@@ -230,8 +313,9 @@ class Repository:
                         capture_id, plate, place, camera, captured_at,
                         discovered_at, image_width, image_height,
                         plate_x1, plate_y1, plate_x2, plate_y2,
-                        group_key, cache_image_path, needs_new_assessment
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                        group_key, cache_image_path, eligible,
+                        needs_new_assessment
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1)
                     """,
                     (
                         directory,
@@ -258,6 +342,11 @@ class Repository:
                 return int(cursor.lastrowid), True
 
             if existing["pair_signature"] == pair.signature:
+                if not bool(existing["eligible"]):
+                    self.connection.execute(
+                        "UPDATE observations SET eligible=1 WHERE id=?",
+                        (int(existing["id"]),),
+                    )
                 return int(existing["id"]), False
 
             self.connection.execute(
@@ -267,7 +356,7 @@ class Repository:
                     plate=?, place=?, camera=?, captured_at=?, discovered_at=?,
                     image_width=?, image_height=?, plate_x1=?, plate_y1=?,
                     plate_x2=?, plate_y2=?, group_key=?, cache_image_path=?,
-                    needs_new_assessment=1, attempt_count=0,
+                    eligible=1, needs_new_assessment=1, attempt_count=0,
                     attempt_criteria_hash=NULL, retry_after=NULL,
                     failed_criteria_hash=NULL, last_error=NULL
                 WHERE id=?
@@ -281,6 +370,7 @@ class Repository:
             """
             SELECT id, group_key, captured_at
             FROM observations
+            WHERE eligible=1
             ORDER BY group_key, captured_at, image_path
             """
         ).fetchall()
@@ -304,6 +394,9 @@ class Repository:
                 previous = captured
 
         with self.connection:
+            self.connection.execute(
+                "UPDATE observations SET series_id=NULL WHERE eligible=0"
+            )
             self.connection.executemany(
                 "UPDATE observations SET series_id=? WHERE id=?", assignments
             )
@@ -312,7 +405,8 @@ class Repository:
         row = self.connection.execute(
             """
             SELECT 1 FROM observations
-            WHERE (needs_new_assessment=1 OR probability IS NULL)
+            WHERE eligible=1
+              AND (needs_new_assessment=1 OR probability IS NULL)
               AND (failed_criteria_hash IS NULL OR failed_criteria_hash <> ?)
             LIMIT 1
             """,
@@ -326,7 +420,8 @@ class Repository:
         rows = self.connection.execute(
             """
             SELECT * FROM observations
-            WHERE (needs_new_assessment=1 OR probability IS NULL)
+            WHERE eligible=1
+              AND (needs_new_assessment=1 OR probability IS NULL)
               AND (failed_criteria_hash IS NULL OR failed_criteria_hash <> ?)
               AND (retry_after IS NULL OR retry_after <= ?)
             ORDER BY captured_at, discovered_at, image_path
@@ -342,7 +437,8 @@ class Repository:
         rows = self.connection.execute(
             """
             SELECT * FROM observations
-            WHERE needs_new_assessment=0
+            WHERE eligible=1
+              AND needs_new_assessment=0
               AND probability IS NOT NULL
               AND (criteria_hash IS NULL OR criteria_hash <> ?)
               AND (failed_criteria_hash IS NULL OR failed_criteria_hash <> ?)
@@ -459,7 +555,7 @@ class Repository:
         rows = self.connection.execute(
             """
             SELECT * FROM observations
-            WHERE series_id IS NOT NULL
+            WHERE eligible=1 AND series_id IS NOT NULL
             ORDER BY series_id, captured_at, image_path
             """
         ).fetchall()
@@ -572,6 +668,7 @@ class Repository:
                          THEN 1 ELSE 0 END) AS stale,
                 SUM(CASE WHEN failed_criteria_hash = ? THEN 1 ELSE 0 END) AS failed
             FROM observations
+            WHERE eligible=1
             """,
             (criteria_hash, criteria_hash),
         ).fetchone()
@@ -619,6 +716,7 @@ class Repository:
                 SUM(CASE WHEN failed_criteria_hash = ?
                          THEN 1 ELSE 0 END) AS failed_current
             FROM observations
+            WHERE eligible=1
             """,
             (criteria_hash, criteria_hash),
         ).fetchone()

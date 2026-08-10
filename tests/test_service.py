@@ -104,6 +104,7 @@ def _xml() -> bytes:
     <ImageWidth>320</ImageWidth><ImageHeight>200</ImageHeight>
     <Position><X1>100</X1><Y1>100</Y1><X2>150</X2><Y2>120</Y2></Position>
   </ImagesInfo>
+  <Coordinates><Pdop>1.1</Pdop></Coordinates>
   <Address>test address</Address>
   <CameraSerialNumber>camera-1</CameraSerialNumber>
 </RecognitionData>"""
@@ -237,5 +238,91 @@ def test_transient_ai_error_stays_in_queue(tmp_path) -> None:
         assert row["failed_criteria_hash"] is None
         assert row["retry_after"] is not None
         assert row["needs_new_assessment"] == 1
+    finally:
+        service.close()
+
+
+def test_cycle_excludes_pair_with_other_pdop(tmp_path) -> None:
+    criteria_path = tmp_path / "criteria.txt"
+    criteria_path.write_text("criterion one\n", encoding="utf-8")
+    settings = Settings(
+        ftp_host="example",
+        ftp_port=21,
+        ftp_user="user",
+        ftp_password="password",
+        ftp_root_dir="/root",
+        ftp_stable_polls=1,
+        ai_api_key="key",
+        criteria_file=criteria_path,
+        state_db=tmp_path / "state.db",
+        cache_dir=tmp_path / "cache",
+    )
+    fake_ftp = FakeFtp(_xml(), _jpeg())
+    fake_ftp.source["/root/photo-2.xml"] = (
+        _xml()
+        .replace(b"photo-1", b"photo-2")
+        .replace(b"<Pdop>1.1</Pdop>", b"<Pdop>2.0</Pdop>")
+    )
+    fake_ftp.source["/root/photo-2.jpg"] = _jpeg()
+    fake_ai = FakeAI()
+    service = ParkingScoreService(
+        settings,
+        ai_client=fake_ai,
+        ftp_factory=lambda unused: fake_ftp,
+    )
+    try:
+        service.run_cycle()
+
+        assert fake_ai.stems == ["photo-1"]
+        assert "/root/photo-1.txt" in fake_ftp.uploaded
+        assert "/root/photo-2.txt" not in fake_ftp.uploaded
+        filters = service.repository.connection.execute(
+            "SELECT image_path, pdop, eligible FROM pair_filters ORDER BY image_path"
+        ).fetchall()
+        assert [tuple(row) for row in filters] == [
+            ("/root/photo-1.jpg", "1.1", 1),
+            ("/root/photo-2.jpg", "2.0", 0),
+        ]
+    finally:
+        service.close()
+
+
+def test_changed_pdop_deactivates_existing_observation(tmp_path) -> None:
+    criteria_path = tmp_path / "criteria.txt"
+    criteria_path.write_text("criterion one\n", encoding="utf-8")
+    settings = Settings(
+        ftp_host="example",
+        ftp_port=21,
+        ftp_user="user",
+        ftp_password="password",
+        ftp_root_dir="/root",
+        ftp_stable_polls=1,
+        ai_api_key="key",
+        criteria_file=criteria_path,
+        state_db=tmp_path / "state.db",
+        cache_dir=tmp_path / "cache",
+    )
+    fake_ftp = FakeFtp(_xml(), _jpeg())
+    fake_ai = FakeAI()
+    service = ParkingScoreService(
+        settings,
+        ai_client=fake_ai,
+        ftp_factory=lambda unused: fake_ftp,
+    )
+    try:
+        service.run_cycle()
+        assert fake_ai.calls == 1
+
+        fake_ftp.source["/root/photo-1.xml"] = _xml().replace(
+            b"<Pdop>1.1</Pdop>", b"<Pdop>2.00</Pdop>"
+        )
+        service.run_cycle()
+        row = service.repository.connection.execute(
+            "SELECT eligible, series_id FROM observations LIMIT 1"
+        ).fetchone()
+
+        assert fake_ai.calls == 1
+        assert row["eligible"] == 0
+        assert row["series_id"] is None
     finally:
         service.close()
