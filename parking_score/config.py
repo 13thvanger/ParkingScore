@@ -68,12 +68,14 @@ class Settings:
     max_reprocess_jobs_per_cycle: int = 1
     max_processing_attempts: int = 5
     retry_base_seconds: int = 30
+    progress_report_interval_seconds: int = 3600
 
     ai_api_url: str = "https://bridge-back.admlr.lipetsk.ru/api/v1/chat/completions"
     ai_api_key: str = field(default="", repr=False)
     ai_model: str = "cifra48/agent"
     ai_timeout_seconds: float = 120.0
     ai_request_retries: int = 3
+    ai_worker_threads: int = 4
     ai_temperature: float = 0.0
     ai_max_tokens: int = 1000
     ai_image_max_dimension: int = 1920
@@ -126,6 +128,9 @@ class Settings:
             max_reprocess_jobs_per_cycle=_integer("MAX_REPROCESS_JOBS_PER_CYCLE", 1),
             max_processing_attempts=_integer("MAX_PROCESSING_ATTEMPTS", 5),
             retry_base_seconds=_integer("RETRY_BASE_SECONDS", 30),
+            progress_report_interval_seconds=_integer(
+                "PROGRESS_REPORT_INTERVAL_SECONDS", 3600
+            ),
             ai_api_url=os.getenv(
                 "AI_API_URL",
                 "https://bridge-back.admlr.lipetsk.ru/api/v1/chat/completions",
@@ -134,6 +139,7 @@ class Settings:
             ai_model=os.getenv("AI_MODEL", "cifra48/agent").strip() or "cifra48/agent",
             ai_timeout_seconds=_floating("AI_TIMEOUT_SECONDS", 120.0, 1.0),
             ai_request_retries=_integer("AI_REQUEST_RETRIES", 3),
+            ai_worker_threads=_integer("AI_WORKER_THREADS", 4),
             ai_temperature=_floating("AI_TEMPERATURE", 0.0),
             ai_max_tokens=_integer("AI_MAX_TOKENS", 1000),
             ai_image_max_dimension=_integer("AI_IMAGE_MAX_DIMENSION", 1920, 320),

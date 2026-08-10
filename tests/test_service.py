@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import threading
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Self
@@ -58,6 +60,27 @@ class FakeAI:
         return None
 
 
+class ConcurrentFakeAI(FakeAI):
+    def __init__(self) -> None:
+        super().__init__()
+        self._lock = threading.Lock()
+        self._active = 0
+        self.max_active = 0
+
+    def assess(self, observation, criteria, image) -> Assessment:
+        with self._lock:
+            self.calls += 1
+            self.stems.append(observation.stem)
+            self._active += 1
+            self.max_active = max(self.max_active, self._active)
+        try:
+            time.sleep(0.1)
+            return Assessment(73, [], "test", '{"probability":73,"criteria":[]}')
+        finally:
+            with self._lock:
+                self._active -= 1
+
+
 def _jpeg() -> bytes:
     buffer = io.BytesIO()
     Image.new("RGB", (320, 200), "green").save(buffer, "JPEG")
@@ -107,6 +130,13 @@ def test_cycle_processes_pair_and_finalizes_best(tmp_path) -> None:
         assert fake_ftp.uploaded["/root/photo-1.txt"] == (
             b"probability=73\nbest=false\n"
         )
+        progress = service.repository.connection.execute(
+            "SELECT * FROM progress_snapshots ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert progress["ftp_total_pairs"] == 1
+        assert progress["ftp_stable_pairs"] == 1
+        assert progress["assessed_current"] == 1
+        assert progress["awaiting_assessment"] == 0
 
         old = utc_now() - timedelta(minutes=16)
         with service.repository.connection:
@@ -127,5 +157,43 @@ def test_cycle_processes_pair_and_finalizes_best(tmp_path) -> None:
 
         service.run_cycle()
         assert fake_ai.stems == ["photo-1", "photo-2", "photo-1"]
+    finally:
+        service.close()
+
+
+def test_cycle_assesses_images_concurrently(tmp_path) -> None:
+    criteria_path = tmp_path / "criteria.txt"
+    criteria_path.write_text("criterion one\n", encoding="utf-8")
+    settings = Settings(
+        ftp_host="example",
+        ftp_port=21,
+        ftp_user="user",
+        ftp_password="password",
+        ftp_root_dir="/root",
+        ftp_stable_polls=1,
+        ai_api_key="key",
+        ai_worker_threads=2,
+        criteria_file=criteria_path,
+        state_db=tmp_path / "state.db",
+        cache_dir=tmp_path / "cache",
+    )
+    fake_ftp = FakeFtp(_xml(), _jpeg())
+    fake_ftp.source["/root/photo-2.xml"] = _xml().replace(
+        b"photo-1", b"photo-2"
+    )
+    fake_ftp.source["/root/photo-2.jpg"] = _jpeg()
+    fake_ai = ConcurrentFakeAI()
+    service = ParkingScoreService(
+        settings,
+        ai_client=fake_ai,
+        ftp_factory=lambda unused: fake_ftp,
+    )
+    try:
+        service.run_cycle()
+
+        assert fake_ai.calls == 2
+        assert fake_ai.max_active == 2
+        assert "/root/photo-1.txt" in fake_ftp.uploaded
+        assert "/root/photo-2.txt" in fake_ftp.uploaded
     finally:
         service.close()

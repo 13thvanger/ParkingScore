@@ -121,3 +121,41 @@ def test_new_jobs_are_ordered_by_capture_time(tmp_path) -> None:
         assert [job.id for job in jobs] == [older, newer]
     finally:
         repository.close()
+
+
+def test_progress_snapshot_uses_current_criteria(tmp_path) -> None:
+    repository = Repository(tmp_path / "state.db")
+    started = datetime(2026, 8, 1, tzinfo=UTC)
+    try:
+        assessed = _add(repository, "assessed", started, started)
+        _add(repository, "pending", started + timedelta(minutes=1), started)
+        repository.save_assessment(
+            assessed, "criteria-v1", _assessment(80), started
+        )
+
+        progress = repository.record_progress_snapshot(
+            "criteria-v1",
+            ftp_total_pairs=3,
+            ftp_stable_pairs=2,
+            now=started,
+        )
+
+        assert progress == {
+            "ftp_total_pairs": 3,
+            "ftp_stable_pairs": 2,
+            "discovered_total": 2,
+            "assessed_current": 1,
+            "awaiting_assessment": 2,
+            "failed_current": 0,
+        }
+        assert not repository.progress_report_due(
+            "criteria-v1", 3600, started + timedelta(minutes=59)
+        )
+        assert repository.progress_report_due(
+            "criteria-v1", 3600, started + timedelta(hours=1)
+        )
+        assert repository.progress_report_due(
+            "criteria-v2", 3600, started + timedelta(minutes=1)
+        )
+    finally:
+        repository.close()

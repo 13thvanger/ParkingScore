@@ -109,6 +109,21 @@ class Repository:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS progress_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at TEXT NOT NULL,
+                criteria_hash TEXT NOT NULL,
+                ftp_total_pairs INTEGER NOT NULL,
+                ftp_stable_pairs INTEGER NOT NULL,
+                discovered_total INTEGER NOT NULL,
+                assessed_current INTEGER NOT NULL,
+                awaiting_assessment INTEGER NOT NULL,
+                failed_current INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_progress_snapshots_recorded
+                ON progress_snapshots(recorded_at);
             """
         )
         self.connection.commit()
@@ -546,6 +561,82 @@ class Repository:
             key: int(row[key] or 0)
             for key in ("total", "unassessed", "stale", "failed")
         }
+
+    def progress_report_due(
+        self,
+        criteria_hash: str,
+        interval_seconds: int,
+        now: datetime | None = None,
+    ) -> bool:
+        now = now or utc_now()
+        row = self.connection.execute(
+            """
+            SELECT recorded_at, criteria_hash
+            FROM progress_snapshots
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None or row["criteria_hash"] != criteria_hash:
+            return True
+        elapsed = now - from_iso(str(row["recorded_at"]))
+        return elapsed.total_seconds() >= interval_seconds
+
+    def record_progress_snapshot(
+        self,
+        criteria_hash: str,
+        ftp_total_pairs: int,
+        ftp_stable_pairs: int,
+        now: datetime | None = None,
+    ) -> dict[str, int]:
+        now = now or utc_now()
+        row = self.connection.execute(
+            """
+            SELECT
+                COUNT(*) AS discovered_total,
+                SUM(CASE WHEN probability IS NOT NULL
+                              AND criteria_hash = ?
+                              AND needs_new_assessment = 0
+                         THEN 1 ELSE 0 END) AS assessed_current,
+                SUM(CASE WHEN failed_criteria_hash = ?
+                         THEN 1 ELSE 0 END) AS failed_current
+            FROM observations
+            """,
+            (criteria_hash, criteria_hash),
+        ).fetchone()
+        discovered_total = int(row["discovered_total"] or 0)
+        assessed_current = int(row["assessed_current"] or 0)
+        failed_current = int(row["failed_current"] or 0)
+        awaiting_assessment = max(ftp_total_pairs - assessed_current, 0)
+        snapshot = {
+            "ftp_total_pairs": ftp_total_pairs,
+            "ftp_stable_pairs": ftp_stable_pairs,
+            "discovered_total": discovered_total,
+            "assessed_current": assessed_current,
+            "awaiting_assessment": awaiting_assessment,
+            "failed_current": failed_current,
+        }
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO progress_snapshots (
+                    recorded_at, criteria_hash, ftp_total_pairs,
+                    ftp_stable_pairs, discovered_total, assessed_current,
+                    awaiting_assessment, failed_current
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    to_iso(now),
+                    criteria_hash,
+                    ftp_total_pairs,
+                    ftp_stable_pairs,
+                    discovered_total,
+                    assessed_current,
+                    awaiting_assessment,
+                    failed_current,
+                ),
+            )
+        return snapshot
 
     def _observation(self, row: sqlite3.Row) -> Observation:
         box = None

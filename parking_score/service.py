@@ -4,6 +4,7 @@ import logging
 import signal
 import threading
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
@@ -13,7 +14,7 @@ from .criteria import CriteriaSet, load_criteria
 from .database import Repository, to_iso, utc_now
 from .ftp_client import FtpClient, build_pairs
 from .image_processor import prepare_image
-from .models import Observation
+from .models import Assessment, Observation
 from .xml_parser import parse_recognition_xml
 
 logger = logging.getLogger(__name__)
@@ -48,10 +49,11 @@ class ParkingScoreService:
             )
         self.repository.set_meta("criteria_hash", criteria.content_hash)
 
-        discovered = self._discover()
+        discovered, ftp_total_pairs, ftp_stable_pairs = self._discover()
         self.repository.rebuild_series(self.settings.series_window_minutes)
         processed, mode, published = self._process_jobs(criteria)
         published += self._publish_outputs(criteria)
+        self._report_progress_if_due(criteria, ftp_total_pairs, ftp_stable_pairs)
         self._heartbeat()
 
         statistics = self.repository.statistics(criteria.content_hash)
@@ -68,7 +70,7 @@ class ParkingScoreService:
             statistics["failed"],
         )
 
-    def _discover(self) -> int:
+    def _discover(self) -> tuple[int, int, int]:
         discovered = 0
         with self.ftp_factory(self.settings) as ftp:
             logger.info(
@@ -81,13 +83,20 @@ class ParkingScoreService:
             )
             logger.info("FTP listing complete files=%d", len(files))
             stable_counts = self.repository.update_remote_files(files)
-            stable_files = [
-                item
-                for item in files
-                if stable_counts.get(item.path, 0) >= self.settings.ftp_stable_polls
+            available_pairs = build_pairs(files, self.settings.image_extensions)
+            pairs = [
+                pair
+                for pair in available_pairs
+                if stable_counts.get(pair.image.path, 0)
+                >= self.settings.ftp_stable_polls
+                and stable_counts.get(pair.xml.path, 0)
+                >= self.settings.ftp_stable_polls
             ]
-            pairs = build_pairs(stable_files, self.settings.image_extensions)
-            logger.info("FTP stable pairs found=%d", len(pairs))
+            logger.info(
+                "FTP pairs found total=%d stable=%d",
+                len(available_pairs),
+                len(pairs),
+            )
             for index, pair in enumerate(pairs, start=1):
                 if not self.repository.pair_needs_ingest(pair):
                     continue
@@ -117,7 +126,7 @@ class ParkingScoreService:
                         len(pairs),
                         discovered,
                     )
-        return discovered
+        return discovered, len(available_pairs), len(pairs)
 
     def _process_jobs(self, criteria: CriteriaSet) -> tuple[int, str, int]:
         now = utc_now()
@@ -138,44 +147,110 @@ class ParkingScoreService:
 
         processed = 0
         published = 0
+        ready_jobs: list[Observation] = []
         for observation in jobs:
             try:
                 self._ensure_cached_image(observation)
-                prepared = prepare_image(
-                    str(observation.cache_image_path),
-                    observation,
-                    self.settings.ai_image_max_dimension,
-                    self.settings.ai_image_jpeg_quality,
-                    self.settings.ai_image_max_bytes,
-                )
-                assessment = self.ai_client.assess(observation, criteria, prepared)
-                self.repository.save_assessment(
-                    observation.id, criteria.content_hash, assessment
-                )
-                processed += 1
-                published += self._publish_outputs(criteria)
-                logger.info(
-                    "Image assessed path=%s probability=%d mode=%s",
-                    observation.image_path,
-                    assessment.probability,
-                    mode,
-                )
-            except Exception as exc:
-                exhausted = self.repository.record_failure(
-                    observation.id,
-                    criteria.content_hash,
-                    str(exc),
-                    self.settings.max_processing_attempts,
-                    self.settings.retry_base_seconds,
-                )
-                logger.exception(
-                    "Image assessment failed path=%s exhausted=%s",
-                    observation.image_path,
-                    exhausted,
-                )
-            finally:
+            except Exception as exc:  # noqa: BLE001 - isolate one failed job
+                self._record_processing_failure(observation, criteria, exc)
                 self._heartbeat()
+            else:
+                ready_jobs.append(observation)
+
+        worker_count = min(self.settings.ai_worker_threads, len(ready_jobs))
+        if worker_count:
+            logger.info(
+                "AI batch started jobs=%d workers=%d mode=%s",
+                len(ready_jobs),
+                worker_count,
+                mode,
+            )
+            with ThreadPoolExecutor(
+                max_workers=worker_count, thread_name_prefix="ai-worker"
+            ) as executor:
+                futures: dict[Future[Assessment], Observation] = {
+                    executor.submit(self._assess_observation, job, criteria): job
+                    for job in ready_jobs
+                }
+                for future in as_completed(futures):
+                    observation = futures[future]
+                    try:
+                        assessment = future.result()
+                        self.repository.save_assessment(
+                            observation.id, criteria.content_hash, assessment
+                        )
+                        processed += 1
+                        published += self._publish_outputs(criteria)
+                        logger.info(
+                            "Image assessed path=%s probability=%d mode=%s",
+                            observation.image_path,
+                            assessment.probability,
+                            mode,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - isolate one failed job
+                        self._record_processing_failure(observation, criteria, exc)
+                    finally:
+                        self._heartbeat()
         return processed, mode, published
+
+    def _report_progress_if_due(
+        self,
+        criteria: CriteriaSet,
+        ftp_total_pairs: int,
+        ftp_stable_pairs: int,
+    ) -> None:
+        now = utc_now()
+        if not self.repository.progress_report_due(
+            criteria.content_hash,
+            self.settings.progress_report_interval_seconds,
+            now,
+        ):
+            return
+        progress = self.repository.record_progress_snapshot(
+            criteria.content_hash,
+            ftp_total_pairs,
+            ftp_stable_pairs,
+            now,
+        )
+        logger.info(
+            "Progress report ftp_pairs=%d stable_pairs=%d assessed=%d "
+            "awaiting=%d discovered=%d failed=%d criteria=%s",
+            progress["ftp_total_pairs"],
+            progress["ftp_stable_pairs"],
+            progress["assessed_current"],
+            progress["awaiting_assessment"],
+            progress["discovered_total"],
+            progress["failed_current"],
+            criteria.content_hash[:12],
+        )
+
+    def _assess_observation(
+        self, observation: Observation, criteria: CriteriaSet
+    ) -> Assessment:
+        prepared = prepare_image(
+            str(observation.cache_image_path),
+            observation,
+            self.settings.ai_image_max_dimension,
+            self.settings.ai_image_jpeg_quality,
+            self.settings.ai_image_max_bytes,
+        )
+        return self.ai_client.assess(observation, criteria, prepared)
+
+    def _record_processing_failure(
+        self, observation: Observation, criteria: CriteriaSet, error: Exception
+    ) -> None:
+        exhausted = self.repository.record_failure(
+            observation.id,
+            criteria.content_hash,
+            str(error),
+            self.settings.max_processing_attempts,
+            self.settings.retry_base_seconds,
+        )
+        logger.exception(
+            "Image assessment failed path=%s exhausted=%s",
+            observation.image_path,
+            exhausted,
+        )
 
     def _ensure_cached_image(self, observation: Observation) -> None:
         if observation.cache_image_path.exists():
