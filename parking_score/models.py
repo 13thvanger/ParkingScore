@@ -50,7 +50,7 @@ class PhotoMetadata:
     image_height: int | None
     plate_box: PlateBox | None
     group_key: str
-    pdop: str | None = None
+    sign: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -37,6 +37,41 @@ def _assessment(probability: int) -> Assessment:
     return Assessment(probability, [], "", "{}")
 
 
+def test_pair_filter_version_invalidates_cached_decisions(tmp_path) -> None:
+    repository = Repository(tmp_path / "state.db")
+    started = datetime(2026, 8, 19, tzinfo=UTC)
+    pair = RemotePair(
+        RemoteFile("/camera/a.jpg", 100, "20260819000000"),
+        RemoteFile("/camera/a.xml", 50, "20260819000000"),
+    )
+    try:
+        _add(repository, "a", started, started)
+        repository.record_pair_filter(pair, "1.1", eligible=True, now=started)
+        repository.rebuild_series(15)
+        repository.set_meta("pair_filter_version", "pdop-equals-1.1-v1")
+        before = repository.connection.execute(
+            "SELECT eligible, series_id FROM observations WHERE image_path=?",
+            (pair.image.path,),
+        ).fetchone()
+        assert before["eligible"] == 1
+        assert before["series_id"] is not None
+
+        filter_version = "sign-in-1.01-1.01.5-1.01.6-v2"
+        assert repository.ensure_pair_filter_version(filter_version)
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM pair_filters"
+        ).fetchone()[0] == 0
+        observation = repository.connection.execute(
+            "SELECT eligible, series_id FROM observations WHERE image_path=?",
+            (pair.image.path,),
+        ).fetchone()
+        assert observation["eligible"] == 0
+        assert observation["series_id"] is None
+        assert not repository.ensure_pair_filter_version(filter_version)
+    finally:
+        repository.close()
+
+
 def test_series_use_gap_between_consecutive_photos(tmp_path) -> None:
     repository = Repository(tmp_path / "state.db")
     start = datetime(2026, 8, 1, tzinfo=UTC)

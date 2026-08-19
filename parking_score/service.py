@@ -16,9 +16,10 @@ from .database import Repository, to_iso, utc_now
 from .ftp_client import FtpClient, build_pairs
 from .image_processor import prepare_image
 from .models import Assessment, Observation
-from .xml_parser import extract_pdop, has_required_pdop, parse_recognition_xml
+from .xml_parser import extract_sign, has_required_sign, parse_recognition_xml
 
 logger = logging.getLogger(__name__)
+PAIR_FILTER_VERSION = "sign-in-1.01-1.01.5-1.01.6-v2"
 
 
 class ParkingScoreService:
@@ -55,6 +56,11 @@ class ParkingScoreService:
         )
         if released:
             logger.info("Legacy transient AI failures requeued count=%d", released)
+        if self.repository.ensure_pair_filter_version(PAIR_FILTER_VERSION):
+            logger.info(
+                "FTP admission filter changed; cached decisions invalidated rule=%s",
+                PAIR_FILTER_VERSION,
+            )
 
         discovered, ftp_total_pairs, ftp_stable_pairs = self._discover()
         self.repository.rebuild_series(self.settings.series_window_minutes)
@@ -120,10 +126,10 @@ class ParkingScoreService:
                 self.repository.deactivate_observation(pair.image.path)
                 try:
                     xml_data = ftp.download_bytes(pair.xml.path)
-                    pdop = extract_pdop(xml_data)
-                    if not has_required_pdop(pdop):
+                    sign = extract_sign(xml_data)
+                    if not has_required_sign(sign):
                         self.repository.record_pair_filter(
-                            pair, pdop, eligible=False
+                            pair, sign, eligible=False
                         )
                         excluded_pairs += 1
                         continue
@@ -138,7 +144,7 @@ class ParkingScoreService:
                     if changed:
                         local_path.unlink(missing_ok=True)
                     self.repository.record_pair_filter(
-                        pair, metadata.pdop, eligible=True
+                        pair, metadata.sign, eligible=True
                     )
                     eligible_pairs += 1
                     if changed:
@@ -157,7 +163,7 @@ class ParkingScoreService:
                         discovered,
                     )
             logger.info(
-                "FTP Pdop filter complete eligible=%d excluded=%d unchecked=%d",
+                "FTP Sign filter complete eligible=%d excluded=%d unchecked=%d",
                 eligible_pairs,
                 excluded_pairs,
                 len(pairs) - eligible_pairs - excluded_pairs,

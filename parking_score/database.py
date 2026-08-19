@@ -114,7 +114,7 @@ class Repository:
             CREATE TABLE IF NOT EXISTS pair_filters (
                 image_path TEXT PRIMARY KEY,
                 pair_signature TEXT NOT NULL,
-                pdop TEXT,
+                filter_value TEXT,
                 eligible INTEGER NOT NULL,
                 checked_at TEXT NOT NULL
             );
@@ -178,6 +178,14 @@ class Repository:
             ON observations(eligible, needs_new_assessment, criteria_hash, retry_after)
             """
         )
+        filter_columns = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(pair_filters)")
+        }
+        if "filter_value" not in filter_columns:
+            self.connection.execute(
+                "ALTER TABLE pair_filters ADD COLUMN filter_value TEXT"
+            )
         event_columns = {
             str(row["name"])
             for row in self.connection.execute("PRAGMA table_info(assessment_events)")
@@ -252,7 +260,7 @@ class Repository:
     def record_pair_filter(
         self,
         pair: RemotePair,
-        pdop: str | None,
+        filter_value: str | None,
         eligible: bool,
         now: datetime | None = None,
     ) -> None:
@@ -261,18 +269,18 @@ class Repository:
             self.connection.execute(
                 """
                 INSERT INTO pair_filters (
-                    image_path, pair_signature, pdop, eligible, checked_at
+                    image_path, pair_signature, filter_value, eligible, checked_at
                 ) VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(image_path) DO UPDATE SET
                     pair_signature=excluded.pair_signature,
-                    pdop=excluded.pdop,
+                    filter_value=excluded.filter_value,
                     eligible=excluded.eligible,
                     checked_at=excluded.checked_at
                 """,
                 (
                     pair.image.path,
                     pair.signature,
-                    pdop,
+                    filter_value,
                     int(eligible),
                     to_iso(now),
                 ),
@@ -802,6 +810,25 @@ class Repository:
                 """,
                 (key, value),
             )
+
+    def ensure_pair_filter_version(self, version: str) -> bool:
+        """Invalidate cached decisions when the XML admission rule changes."""
+        current = self.get_meta("pair_filter_version")
+        if current == version:
+            return False
+        with self.connection:
+            self.connection.execute("DELETE FROM pair_filters")
+            self.connection.execute(
+                "UPDATE observations SET eligible=0, series_id=NULL"
+            )
+            self.connection.execute(
+                """
+                INSERT INTO meta(key, value) VALUES ('pair_filter_version', ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (version,),
+            )
+        return True
 
     def get_meta(self, key: str) -> str | None:
         row = self.connection.execute(

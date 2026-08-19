@@ -104,8 +104,9 @@ def _xml() -> bytes:
     <ImageWidth>320</ImageWidth><ImageHeight>200</ImageHeight>
     <Position><X1>100</X1><Y1>100</Y1><X2>150</X2><Y2>120</Y2></Position>
   </ImagesInfo>
-  <Coordinates><Pdop>1.1</Pdop></Coordinates>
+  <Coordinates></Coordinates>
   <Address>test address</Address>
+  <Sign>1.01</Sign>
   <CameraSerialNumber>camera-1</CameraSerialNumber>
 </RecognitionData>"""
 
@@ -256,7 +257,7 @@ def test_transient_ai_error_stays_in_queue(tmp_path) -> None:
         service.close()
 
 
-def test_cycle_excludes_pair_with_other_pdop(tmp_path) -> None:
+def test_cycle_accepts_parking_sign_codes_and_excludes_other(tmp_path) -> None:
     criteria_path = tmp_path / "criteria.txt"
     criteria_path.write_text("criterion one\n", encoding="utf-8")
     settings = Settings(
@@ -275,9 +276,21 @@ def test_cycle_excludes_pair_with_other_pdop(tmp_path) -> None:
     fake_ftp.source["/root/photo-2.xml"] = (
         _xml()
         .replace(b"photo-1", b"photo-2")
-        .replace(b"<Pdop>1.1</Pdop>", b"<Pdop>2.0</Pdop>")
+        .replace(b"<Sign>1.01</Sign>", b"<Sign>1.01.5</Sign>")
     )
     fake_ftp.source["/root/photo-2.jpg"] = _jpeg()
+    fake_ftp.source["/root/photo-3.xml"] = (
+        _xml()
+        .replace(b"photo-1", b"photo-3")
+        .replace(b"<Sign>1.01</Sign>", b"<Sign>1.01.6</Sign>")
+    )
+    fake_ftp.source["/root/photo-3.jpg"] = _jpeg()
+    fake_ftp.source["/root/photo-4.xml"] = (
+        _xml()
+        .replace(b"photo-1", b"photo-4")
+        .replace(b"<Sign>1.01</Sign>", b"<Sign>2.0</Sign>")
+    )
+    fake_ftp.source["/root/photo-4.jpg"] = _jpeg()
     fake_ai = FakeAI()
     service = ParkingScoreService(
         settings,
@@ -287,21 +300,29 @@ def test_cycle_excludes_pair_with_other_pdop(tmp_path) -> None:
     try:
         service.run_cycle()
 
-        assert fake_ai.stems == ["photo-1"]
+        assert sorted(fake_ai.stems) == ["photo-1", "photo-2", "photo-3"]
         assert "/root/photo-1.txt" in fake_ftp.uploaded
-        assert "/root/photo-2.txt" not in fake_ftp.uploaded
+        assert "/root/photo-2.txt" in fake_ftp.uploaded
+        assert "/root/photo-3.txt" in fake_ftp.uploaded
+        assert "/root/photo-4.txt" not in fake_ftp.uploaded
         filters = service.repository.connection.execute(
-            "SELECT image_path, pdop, eligible FROM pair_filters ORDER BY image_path"
+            """
+            SELECT image_path, filter_value, eligible
+            FROM pair_filters
+            ORDER BY image_path
+            """
         ).fetchall()
         assert [tuple(row) for row in filters] == [
-            ("/root/photo-1.jpg", "1.1", 1),
-            ("/root/photo-2.jpg", "2.0", 0),
+            ("/root/photo-1.jpg", "1.01", 1),
+            ("/root/photo-2.jpg", "1.01.5", 1),
+            ("/root/photo-3.jpg", "1.01.6", 1),
+            ("/root/photo-4.jpg", "2.0", 0),
         ]
     finally:
         service.close()
 
 
-def test_changed_pdop_deactivates_existing_observation(tmp_path) -> None:
+def test_changed_sign_deactivates_existing_observation(tmp_path) -> None:
     criteria_path = tmp_path / "criteria.txt"
     criteria_path.write_text("criterion one\n", encoding="utf-8")
     settings = Settings(
@@ -328,7 +349,7 @@ def test_changed_pdop_deactivates_existing_observation(tmp_path) -> None:
         assert fake_ai.calls == 1
 
         fake_ftp.source["/root/photo-1.xml"] = _xml().replace(
-            b"<Pdop>1.1</Pdop>", b"<Pdop>2.00</Pdop>"
+            b"<Sign>1.01</Sign>", b"<Sign>2.0</Sign>"
         )
         service.run_cycle()
         row = service.repository.connection.execute(
