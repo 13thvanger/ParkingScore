@@ -96,3 +96,10 @@ class OutputUpdate:
     observation_id: int
     remote_path: str
     content: str
+
+
+@dataclass(frozen=True, slots=True)
+class AssessmentLogUpdate:
+    log_date: str
+    content: str
+    content_hash: str

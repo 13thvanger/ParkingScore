@@ -138,6 +138,17 @@ def test_cycle_processes_pair_and_finalizes_best(tmp_path) -> None:
         assert fake_ftp.uploaded["/root/photo-1.txt"] == (
             b"probability=73\nbest=false\n"
         )
+        log_path = next(
+            path for path in fake_ftp.uploaded if path.endswith(".log")
+        )
+        assert log_path.startswith("/")
+        assert log_path.count("/") == 1
+        log_content = fake_ftp.uploaded[log_path].decode("utf-8")
+        assert log_content.startswith(
+            "дата оценки\tвремя оценки\tпапка на ftp сервере\t"
+            "имя факта\tоценка\tлучший\n"
+        )
+        assert "\t/root\tphoto-1\t73\tfalse\n" in log_content
         progress = service.repository.connection.execute(
             "SELECT * FROM progress_snapshots ORDER BY id DESC LIMIT 1"
         ).fetchone()
@@ -155,6 +166,9 @@ def test_cycle_processes_pair_and_finalizes_best(tmp_path) -> None:
         assert fake_ai.calls == 1
         assert fake_ftp.uploaded["/root/photo-1.txt"] == (
             b"probability=73\nbest=true\n"
+        )
+        assert "\t/root\tphoto-1\t73\ttrue\n" in (
+            fake_ftp.uploaded[log_path].decode("utf-8")
         )
 
         criteria_path.write_text("changed criterion\n", encoding="utf-8")

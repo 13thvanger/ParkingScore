@@ -5,11 +5,12 @@ import json
 import sqlite3
 from collections import defaultdict
 from collections.abc import Iterable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 
 from .models import (
     Assessment,
+    AssessmentLogUpdate,
     Observation,
     OutputUpdate,
     PhotoMetadata,
@@ -34,6 +35,10 @@ def from_iso(value: str) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _tsv_value(value: str) -> str:
+    return " ".join(value.replace("\t", " ").splitlines()).strip()
 
 
 class Repository:
@@ -133,6 +138,28 @@ class Repository:
 
             CREATE INDEX IF NOT EXISTS idx_progress_snapshots_recorded
                 ON progress_snapshots(recorded_at);
+
+            CREATE TABLE IF NOT EXISTS assessment_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                observation_id INTEGER NOT NULL,
+                directory TEXT NOT NULL,
+                stem TEXT NOT NULL,
+                assessed_at TEXT NOT NULL,
+                probability INTEGER NOT NULL,
+                criteria_hash TEXT NOT NULL,
+                best INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(observation_id, assessed_at, criteria_hash),
+                FOREIGN KEY(observation_id) REFERENCES observations(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_assessment_events_time
+                ON assessment_events(assessed_at, id);
+
+            CREATE TABLE IF NOT EXISTS assessment_log_publications (
+                log_date TEXT PRIMARY KEY,
+                content_hash TEXT NOT NULL,
+                published_at TEXT NOT NULL
+            );
             """
         )
         columns = {
@@ -465,7 +492,8 @@ class Repository:
                     probability=?, criteria_details=?, comment=?, raw_response=?,
                     criteria_hash=?, assessed_at=?, needs_new_assessment=0,
                     attempt_count=0, attempt_criteria_hash=NULL, retry_after=NULL,
-                    failed_criteria_hash=NULL, last_error=NULL
+                    failed_criteria_hash=NULL, last_error=NULL,
+                    published_content=NULL
                 WHERE id=?
                 """,
                 (
@@ -478,6 +506,44 @@ class Repository:
                     observation_id,
                 ),
             )
+            self.connection.execute(
+                """
+                INSERT INTO assessment_events (
+                    observation_id, directory, stem, assessed_at,
+                    probability, criteria_hash, best
+                )
+                SELECT id, directory, stem, ?, ?, ?, 0
+                FROM observations
+                WHERE id=?
+                """,
+                (
+                    to_iso(now),
+                    assessment.probability,
+                    criteria_hash,
+                    observation_id,
+                ),
+            )
+
+    def backfill_assessment_events(self) -> int:
+        """Create audit events for current assessments made before this feature."""
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                INSERT OR IGNORE INTO assessment_events (
+                    observation_id, directory, stem, assessed_at,
+                    probability, criteria_hash, best
+                )
+                SELECT
+                    id, directory, stem, assessed_at, probability, criteria_hash,
+                    CASE WHEN published_content LIKE '%best=true%' THEN 1 ELSE 0 END
+                FROM observations
+                WHERE eligible=1
+                  AND assessed_at IS NOT NULL
+                  AND probability IS NOT NULL
+                  AND criteria_hash IS NOT NULL
+                """
+            )
+        return int(cursor.rowcount)
 
     def record_failure(
         self,
@@ -639,6 +705,99 @@ class Repository:
             self.connection.execute(
                 "UPDATE observations SET published_content=? WHERE id=?",
                 (content, observation_id),
+            )
+
+    def set_latest_assessment_best(
+        self, observation_id: int, best: bool
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE assessment_events
+                SET best=?
+                WHERE id=(
+                    SELECT id
+                    FROM assessment_events
+                    WHERE observation_id=?
+                    ORDER BY assessed_at DESC, id DESC
+                    LIMIT 1
+                )
+                """,
+                (int(best), observation_id),
+            )
+
+    def assessment_log_updates(
+        self, timezone: tzinfo
+    ) -> list[AssessmentLogUpdate]:
+        rows = self.connection.execute(
+            """
+            SELECT
+                event.id, event.directory, event.stem, event.assessed_at,
+                event.probability, event.best
+            FROM assessment_events AS event
+            JOIN observations AS observation
+              ON observation.id=event.observation_id
+            WHERE observation.eligible=1
+            ORDER BY event.assessed_at, event.id
+            """
+        ).fetchall()
+        header = (
+            "дата оценки\tвремя оценки\tпапка на ftp сервере\t"
+            "имя факта\tоценка\tлучший\n"
+        )
+        lines_by_date: dict[str, list[str]] = defaultdict(list)
+        for row in rows:
+            assessed = from_iso(str(row["assessed_at"])).astimezone(timezone)
+            log_date = assessed.strftime("%d-%m-%Y")
+            directory = _tsv_value(str(row["directory"]))
+            stem = _tsv_value(str(row["stem"]))
+            lines_by_date[log_date].append(
+                "\t".join(
+                    (
+                        log_date,
+                        assessed.strftime("%H:%M:%S"),
+                        directory,
+                        stem,
+                        str(int(row["probability"])),
+                        "true" if bool(row["best"]) else "false",
+                    )
+                )
+                + "\n"
+            )
+
+        published = {
+            str(row["log_date"]): str(row["content_hash"])
+            for row in self.connection.execute(
+                "SELECT log_date, content_hash FROM assessment_log_publications"
+            )
+        }
+        updates: list[AssessmentLogUpdate] = []
+        for log_date in sorted(set(lines_by_date) | set(published)):
+            content = header + "".join(lines_by_date.get(log_date, []))
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            if published.get(log_date) == content_hash:
+                continue
+            updates.append(AssessmentLogUpdate(log_date, content, content_hash))
+        return updates
+
+    def mark_assessment_log_published(
+        self,
+        log_date: str,
+        content_hash: str,
+        now: datetime | None = None,
+    ) -> None:
+        now = now or utc_now()
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO assessment_log_publications (
+                    log_date, content_hash, published_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(log_date) DO UPDATE SET
+                    content_hash=excluded.content_hash,
+                    published_at=excluded.published_at
+                """,
+                (log_date, content_hash, to_iso(now)),
             )
 
     def set_meta(self, key: str, value: str) -> None:

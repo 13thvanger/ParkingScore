@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
@@ -69,6 +70,7 @@ class Settings:
     max_processing_attempts: int = 5
     retry_base_seconds: int = 30
     progress_report_interval_seconds: int = 3600
+    assessment_log_timezone: str = "Europe/Moscow"
 
     ai_api_url: str = "https://bridge-back.admlr.lipetsk.ru/api/v1/chat/completions"
     ai_api_key: str = field(default="", repr=False)
@@ -120,6 +122,16 @@ class Settings:
             raise ConfigurationError(
                 "AI_RETRY_MAX_SECONDS must be >= AI_RETRY_BASE_SECONDS"
             )
+        assessment_log_timezone = (
+            os.getenv("ASSESSMENT_LOG_TIMEZONE", "Europe/Moscow").strip()
+            or "Europe/Moscow"
+        )
+        try:
+            ZoneInfo(assessment_log_timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ConfigurationError(
+                f"ASSESSMENT_LOG_TIMEZONE is unknown: {assessment_log_timezone}"
+            ) from exc
 
         return cls(
             ftp_host=_required("FTP_HOST"),
@@ -141,6 +153,7 @@ class Settings:
             progress_report_interval_seconds=_integer(
                 "PROGRESS_REPORT_INTERVAL_SECONDS", 3600
             ),
+            assessment_log_timezone=assessment_log_timezone,
             ai_api_url=os.getenv(
                 "AI_API_URL",
                 "https://bridge-back.admlr.lipetsk.ru/api/v1/chat/completions",

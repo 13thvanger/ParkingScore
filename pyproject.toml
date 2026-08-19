@@ -12,6 +12,7 @@ dependencies = [
     "httpx>=0.27,<1",
     "Pillow>=10,<13",
     "python-dotenv>=1,<2",
+    "tzdata>=2025.2,<2027",
 ]
 
 [project.optional-dependencies]

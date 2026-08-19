@@ -7,6 +7,7 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from zoneinfo import ZoneInfo
 
 from .ai_client import AIClient, AITransientError
 from .config import Settings
@@ -33,6 +34,7 @@ class ParkingScoreService:
         self.repository = repository or Repository(settings.state_db)
         self.ai_client = ai_client or AIClient(settings)
         self.ftp_factory = ftp_factory
+        self.assessment_log_timezone = ZoneInfo(settings.assessment_log_timezone)
 
     def close(self) -> None:
         self.ai_client.close()
@@ -55,20 +57,26 @@ class ParkingScoreService:
             logger.info("Legacy transient AI failures requeued count=%d", released)
 
         discovered, ftp_total_pairs, ftp_stable_pairs = self._discover()
+        backfilled = self.repository.backfill_assessment_events()
+        if backfilled:
+            logger.info("Historical assessment log events backfilled count=%d", backfilled)
         self.repository.rebuild_series(self.settings.series_window_minutes)
         processed, mode, published = self._process_jobs(criteria)
         published += self._publish_outputs(criteria)
+        logs_published = self._publish_assessment_logs()
         self._report_progress_if_due(criteria, ftp_total_pairs, ftp_stable_pairs)
         self._heartbeat()
 
         statistics = self.repository.statistics(criteria.content_hash)
         logger.info(
             "Cycle complete discovered=%d processed=%d mode=%s published=%d "
+            "logs_published=%d "
             "total=%d unassessed=%d stale=%d failed=%d",
             discovered,
             processed,
             mode,
             published,
+            logs_published,
             statistics["total"],
             statistics["unassessed"],
             statistics["stale"],
@@ -305,6 +313,10 @@ class ParkingScoreService:
         if not updates:
             return 0
         published = 0
+        for update in updates:
+            self.repository.set_latest_assessment_best(
+                update.observation_id, "best=true" in update.content
+            )
         with self.ftp_factory(self.settings) as ftp:
             for update in updates:
                 try:
@@ -319,6 +331,29 @@ class ParkingScoreService:
                 except Exception:
                     logger.exception(
                         "Cannot publish result path=%s", update.remote_path
+                    )
+        return published
+
+    def _publish_assessment_logs(self) -> int:
+        updates = self.repository.assessment_log_updates(
+            self.assessment_log_timezone
+        )
+        if not updates:
+            return 0
+        published = 0
+        with self.ftp_factory(self.settings) as ftp:
+            for update in updates:
+                remote_path = f"/{update.log_date}.log"
+                try:
+                    ftp.upload_atomic(remote_path, update.content.encode("utf-8"))
+                    self.repository.mark_assessment_log_published(
+                        update.log_date, update.content_hash
+                    )
+                    published += 1
+                    logger.info("Assessment log published path=%s", remote_path)
+                except Exception:
+                    logger.exception(
+                        "Cannot publish assessment log path=%s", remote_path
                     )
         return published
 

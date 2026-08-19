@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 from parking_score.database import Repository
@@ -247,5 +247,47 @@ def test_existing_database_gets_eligible_column(tmp_path) -> None:
 
         assert "eligible" in columns
         assert row["eligible"] == 0
+    finally:
+        repository.close()
+
+
+def test_daily_assessment_log_uses_timezone_and_tracks_best(tmp_path) -> None:
+    repository = Repository(tmp_path / "state.db")
+    assessed_at = datetime(2026, 8, 18, 21, 5, 6, tzinfo=UTC)
+    try:
+        observation_id = _add(repository, "fact-1", assessed_at, assessed_at)
+        repository.save_assessment(
+            observation_id,
+            "criteria-v1",
+            _assessment(87),
+            assessed_at,
+        )
+        repository.set_latest_assessment_best(observation_id, True)
+
+        updates = repository.assessment_log_updates(
+            timezone(timedelta(hours=3))
+        )
+
+        assert len(updates) == 1
+        assert updates[0].log_date == "19-08-2026"
+        assert updates[0].content == (
+            "дата оценки\tвремя оценки\tпапка на ftp сервере\t"
+            "имя факта\tоценка\tлучший\n"
+            "19-08-2026\t00:05:06\t/camera\tfact-1\t87\ttrue\n"
+        )
+
+        repository.mark_assessment_log_published(
+            updates[0].log_date, updates[0].content_hash, assessed_at
+        )
+        assert not repository.assessment_log_updates(
+            timezone(timedelta(hours=3))
+        )
+
+        repository.set_latest_assessment_best(observation_id, False)
+        changed = repository.assessment_log_updates(
+            timezone(timedelta(hours=3))
+        )
+        assert len(changed) == 1
+        assert changed[0].content.endswith("\tfalse\n")
     finally:
         repository.close()
