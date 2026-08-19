@@ -265,7 +265,7 @@ def test_daily_assessment_log_uses_timezone_and_tracks_best(tmp_path) -> None:
         repository.set_latest_assessment_best(observation_id, True)
 
         updates = repository.assessment_log_updates(
-            timezone(timedelta(hours=3))
+            timezone(timedelta(hours=3)), assessed_at
         )
 
         assert len(updates) == 1
@@ -280,14 +280,88 @@ def test_daily_assessment_log_uses_timezone_and_tracks_best(tmp_path) -> None:
             updates[0].log_date, updates[0].content_hash, assessed_at
         )
         assert not repository.assessment_log_updates(
-            timezone(timedelta(hours=3))
+            timezone(timedelta(hours=3)), assessed_at
         )
 
         repository.set_latest_assessment_best(observation_id, False)
         changed = repository.assessment_log_updates(
-            timezone(timedelta(hours=3))
+            timezone(timedelta(hours=3)), assessed_at
         )
         assert len(changed) == 1
         assert changed[0].content.endswith("\tfalse\n")
+    finally:
+        repository.close()
+
+
+def test_daily_log_is_created_without_assessments(tmp_path) -> None:
+    repository = Repository(tmp_path / "state.db")
+    now = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
+    try:
+        updates = repository.assessment_log_updates(
+            timezone(timedelta(hours=3)), now
+        )
+
+        assert len(updates) == 1
+        assert updates[0].log_date == "19-08-2026"
+        assert updates[0].content == (
+            "дата оценки\tвремя оценки\tпапка на ftp сервере\t"
+            "имя факта\tоценка\tлучший\n"
+        )
+    finally:
+        repository.close()
+
+
+def test_preexisting_assessment_events_are_marked_legacy(tmp_path) -> None:
+    db_path = tmp_path / "legacy-events.db"
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        """
+        CREATE TABLE observations (
+            id INTEGER PRIMARY KEY,
+            series_id TEXT,
+            captured_at TEXT NOT NULL,
+            needs_new_assessment INTEGER NOT NULL DEFAULT 1,
+            criteria_hash TEXT,
+            retry_after TEXT
+        );
+        INSERT INTO observations (id, captured_at)
+        VALUES (1, '2026-08-09T10:00:00+00:00');
+
+        CREATE TABLE assessment_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            observation_id INTEGER NOT NULL,
+            directory TEXT NOT NULL,
+            stem TEXT NOT NULL,
+            assessed_at TEXT NOT NULL,
+            probability INTEGER NOT NULL,
+            criteria_hash TEXT NOT NULL,
+            best INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(observation_id, assessed_at, criteria_hash)
+        );
+        INSERT INTO assessment_events (
+            observation_id, directory, stem, assessed_at,
+            probability, criteria_hash, best
+        ) VALUES (
+            1, '/camera', 'old-fact', '2026-08-09T10:00:00+00:00',
+            75, 'criteria-v1', 0
+        );
+        """
+    )
+    connection.close()
+
+    repository = Repository(db_path)
+    now = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
+    try:
+        source = repository.connection.execute(
+            "SELECT source FROM assessment_events"
+        ).fetchone()["source"]
+        updates = repository.assessment_log_updates(
+            timezone(timedelta(hours=3)), now
+        )
+
+        assert source == "legacy"
+        assert len(updates) == 1
+        assert updates[0].log_date == "19-08-2026"
+        assert "old-fact" not in updates[0].content
     finally:
         repository.close()

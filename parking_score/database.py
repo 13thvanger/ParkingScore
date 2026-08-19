@@ -148,6 +148,7 @@ class Repository:
                 probability INTEGER NOT NULL,
                 criteria_hash TEXT NOT NULL,
                 best INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT 'live',
                 UNIQUE(observation_id, assessed_at, criteria_hash),
                 FOREIGN KEY(observation_id) REFERENCES observations(id)
             );
@@ -177,6 +178,15 @@ class Repository:
             ON observations(eligible, needs_new_assessment, criteria_hash, retry_after)
             """
         )
+        event_columns = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(assessment_events)")
+        }
+        if "source" not in event_columns:
+            self.connection.execute(
+                "ALTER TABLE assessment_events "
+                "ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy'"
+            )
         self.connection.commit()
 
     def update_remote_files(
@@ -510,9 +520,9 @@ class Repository:
                 """
                 INSERT INTO assessment_events (
                     observation_id, directory, stem, assessed_at,
-                    probability, criteria_hash, best
+                    probability, criteria_hash, best, source
                 )
-                SELECT id, directory, stem, ?, ?, ?, 0
+                SELECT id, directory, stem, ?, ?, ?, 0, 'live'
                 FROM observations
                 WHERE id=?
                 """,
@@ -523,27 +533,6 @@ class Repository:
                     observation_id,
                 ),
             )
-
-    def backfill_assessment_events(self) -> int:
-        """Create audit events for current assessments made before this feature."""
-        with self.connection:
-            cursor = self.connection.execute(
-                """
-                INSERT OR IGNORE INTO assessment_events (
-                    observation_id, directory, stem, assessed_at,
-                    probability, criteria_hash, best
-                )
-                SELECT
-                    id, directory, stem, assessed_at, probability, criteria_hash,
-                    CASE WHEN published_content LIKE '%best=true%' THEN 1 ELSE 0 END
-                FROM observations
-                WHERE eligible=1
-                  AND assessed_at IS NOT NULL
-                  AND probability IS NOT NULL
-                  AND criteria_hash IS NOT NULL
-                """
-            )
-        return int(cursor.rowcount)
 
     def record_failure(
         self,
@@ -727,8 +716,9 @@ class Repository:
             )
 
     def assessment_log_updates(
-        self, timezone: tzinfo
+        self, timezone: tzinfo, now: datetime | None = None
     ) -> list[AssessmentLogUpdate]:
+        now = now or utc_now()
         rows = self.connection.execute(
             """
             SELECT
@@ -738,6 +728,7 @@ class Repository:
             JOIN observations AS observation
               ON observation.id=event.observation_id
             WHERE observation.eligible=1
+              AND event.source='live'
             ORDER BY event.assessed_at, event.id
             """
         ).fetchall()
@@ -771,8 +762,10 @@ class Repository:
                 "SELECT log_date, content_hash FROM assessment_log_publications"
             )
         }
+        current_log_date = now.astimezone(timezone).strftime("%d-%m-%Y")
+        required_dates = set(lines_by_date) | {current_log_date}
         updates: list[AssessmentLogUpdate] = []
-        for log_date in sorted(set(lines_by_date) | set(published)):
+        for log_date in sorted(required_dates):
             content = header + "".join(lines_by_date.get(log_date, []))
             content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
             if published.get(log_date) == content_hash:

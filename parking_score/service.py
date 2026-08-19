@@ -57,9 +57,6 @@ class ParkingScoreService:
             logger.info("Legacy transient AI failures requeued count=%d", released)
 
         discovered, ftp_total_pairs, ftp_stable_pairs = self._discover()
-        backfilled = self.repository.backfill_assessment_events()
-        if backfilled:
-            logger.info("Historical assessment log events backfilled count=%d", backfilled)
         self.repository.rebuild_series(self.settings.series_window_minutes)
         processed, mode, published = self._process_jobs(criteria)
         published += self._publish_outputs(criteria)
