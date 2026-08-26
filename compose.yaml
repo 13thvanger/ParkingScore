@@ -9,6 +9,7 @@ services:
       CRITERIA_FILE: /app/criteria.txt
       STATE_DB: /data/parking_score.db
       CACHE_DIR: /data/cache
+      EVALUATION_DIRECTORY: /data/evaluation
     volumes:
       - ./criteria.txt:/app/criteria.txt:ro
       - parking-score-data:/data

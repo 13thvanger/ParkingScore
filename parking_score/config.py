@@ -91,6 +91,7 @@ class Settings:
     criteria_file: Path = Path("criteria.txt")
     state_db: Path = Path("data/parking_score.db")
     cache_dir: Path = Path("data/cache")
+    evaluation_directory: Path = Path("data/evaluation")
     image_extensions: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".webp")
     log_level: str = "INFO"
     healthcheck_max_age_seconds: int = 600
@@ -175,6 +176,9 @@ class Settings:
             criteria_file=Path(os.getenv("CRITERIA_FILE", "criteria.txt")).expanduser(),
             state_db=Path(os.getenv("STATE_DB", "data/parking_score.db")).expanduser(),
             cache_dir=Path(os.getenv("CACHE_DIR", "data/cache")).expanduser(),
+            evaluation_directory=Path(
+                os.getenv("EVALUATION_DIRECTORY", "data/evaluation")
+            ).expanduser(),
             image_extensions=extensions,
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
             healthcheck_max_age_seconds=_integer("HEALTHCHECK_MAX_AGE_SECONDS", 600),
@@ -183,3 +187,4 @@ class Settings:
     def ensure_runtime_dirs(self) -> None:
         self.state_db.parent.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.evaluation_directory.mkdir(parents=True, exist_ok=True)

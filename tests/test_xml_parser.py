@@ -1,6 +1,7 @@
 from datetime import UTC
 
 from parking_score.xml_parser import (
+    canonicalize_sign,
     extract_sign,
     has_required_sign,
     normalize_plate,
@@ -36,6 +37,8 @@ def test_parse_recognition_xml() -> None:
     assert metadata.plate_box.x1 == 294
     assert metadata.image_width == 1920
     assert metadata.sign == "1.01"
+    assert metadata.canonical_sign == "1.01"
+    assert metadata.equipment_serial == "02DB0494178"
 
 
 def test_sign_filter_accepts_parking_violation_codes() -> None:
@@ -43,6 +46,7 @@ def test_sign_filter_accepts_parking_violation_codes() -> None:
     assert has_required_sign("1.01")
     assert has_required_sign(" 1.01.5 ")
     assert has_required_sign("1.01.6")
+    assert canonicalize_sign("1.01.5") == "1.01"
     assert not has_required_sign(None)
     assert not has_required_sign("")
     assert not has_required_sign("1.010")
@@ -55,7 +59,7 @@ def test_normalize_visually_equivalent_cyrillic_plate() -> None:
     assert normalize_plate("о 716 мр 48") == "O716MP48"
 
 
-def test_camera_falls_back_to_serial_number_and_position() -> None:
+def test_equipment_serial_prefers_serial_number_without_position() -> None:
     xml = SAMPLE_XML.replace(
         b"<CameraSerialNumber>02DB0494178</CameraSerialNumber>",
         b"<SerialNumber>01-AA530</SerialNumber><PositionCamera>1</PositionCamera>",
@@ -63,7 +67,9 @@ def test_camera_falls_back_to_serial_number_and_position() -> None:
 
     metadata = parse_recognition_xml(xml, fallback_camera="/DozorMA687")
 
-    assert metadata.camera == "01-AA530/position-1"
+    assert metadata.camera == "01-AA530"
+    assert metadata.equipment_serial == "01-AA530"
+    assert metadata.group_key == "O716MP48\x1f01-AA530"
 
 
 def test_camera_falls_back_to_ftp_directory() -> None:
@@ -74,3 +80,15 @@ def test_camera_falls_back_to_ftp_directory() -> None:
     metadata = parse_recognition_xml(xml, fallback_camera="/DozorMA687")
 
     assert metadata.camera == "ftp:/DozorMA687"
+    assert metadata.equipment_serial is None
+
+
+def test_address_does_not_change_series_key() -> None:
+    changed = SAMPLE_XML.replace(
+        "г. Липецк, ул. Кутузова, д. 1".encode(),
+        "другой адрес".encode(),
+    )
+
+    assert parse_recognition_xml(SAMPLE_XML).group_key == parse_recognition_xml(
+        changed
+    ).group_key

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import signal
 import threading
@@ -11,15 +12,20 @@ from zoneinfo import ZoneInfo
 
 from .ai_client import AIClient, AITransientError
 from .config import Settings
-from .criteria import CriteriaSet, load_criteria
+from .criteria import CriteriaError, CriteriaSet, load_criteria
 from .database import Repository, to_iso, utc_now
 from .ftp_client import FtpClient, build_pairs
 from .image_processor import prepare_image
 from .models import Assessment, Observation
-from .xml_parser import extract_sign, has_required_sign, parse_recognition_xml
+from .xml_parser import (
+    ELIGIBLE_SIGN_CODES,
+    extract_sign,
+    has_required_sign,
+    parse_recognition_xml,
+)
 
 logger = logging.getLogger(__name__)
-PAIR_FILTER_VERSION = "sign-in-1.01-1.01.5-1.01.6-v2"
+PAIR_FILTER_VERSION = "sign-family-equipment-serial-source-key-v3"
 
 
 class ParkingScoreService:
@@ -44,7 +50,8 @@ class ParkingScoreService:
     def run_cycle(self) -> None:
         cycle_started = utc_now()
         self._heartbeat(cycle_started)
-        criteria = load_criteria(self.settings.criteria_file)
+        criteria = self._load_active_criteria()
+        interval_minutes = self.settings.series_window_minutes
         previous_hash = self.repository.get_meta("criteria_hash")
         if previous_hash and previous_hash != criteria.content_hash:
             logger.info(
@@ -62,10 +69,12 @@ class ParkingScoreService:
                 PAIR_FILTER_VERSION,
             )
 
-        discovered, ftp_total_pairs, ftp_stable_pairs = self._discover()
-        self.repository.rebuild_series(self.settings.series_window_minutes)
-        processed, mode, published = self._process_jobs(criteria)
-        published += self._publish_outputs(criteria)
+        discovered, ftp_total_pairs, ftp_stable_pairs = self._discover(
+            ELIGIBLE_SIGN_CODES
+        )
+        self.repository.rebuild_series(interval_minutes)
+        processed, mode, published = self._process_jobs(criteria, interval_minutes)
+        published += self._publish_outputs(criteria, interval_minutes)
         logs_published = self._publish_assessment_logs()
         self._report_progress_if_due(criteria, ftp_total_pairs, ftp_stable_pairs)
         self._heartbeat()
@@ -86,7 +95,23 @@ class ParkingScoreService:
             statistics["failed"],
         )
 
-    def _discover(self) -> tuple[int, int, int]:
+    def _load_active_criteria(self) -> CriteriaSet:
+        try:
+            criteria = load_criteria(self.settings.criteria_file)
+        except CriteriaError as exc:
+            previous = self.repository.active_criteria_set()
+            if previous is None:
+                raise
+            logger.error(
+                "Criteria candidate rejected; continuing previous active version=%s: %s",
+                previous.version,
+                exc,
+            )
+            return previous
+        self.repository.register_criteria(criteria, activated=True)
+        return criteria
+
+    def _discover(self, eligible_signs: frozenset[str]) -> tuple[int, int, int]:
         discovered = 0
         with self.ftp_factory(self.settings) as ftp:
             logger.info(
@@ -127,7 +152,7 @@ class ParkingScoreService:
                 try:
                     xml_data = ftp.download_bytes(pair.xml.path)
                     sign = extract_sign(xml_data)
-                    if not has_required_sign(sign):
+                    if not has_required_sign(sign, eligible_signs):
                         self.repository.record_pair_filter(
                             pair, sign, eligible=False
                         )
@@ -170,7 +195,11 @@ class ParkingScoreService:
             )
         return discovered, eligible_pairs, len(pairs)
 
-    def _process_jobs(self, criteria: CriteriaSet) -> tuple[int, str, int]:
+    def _process_jobs(
+        self,
+        criteria: CriteriaSet,
+        interval_minutes: int,
+    ) -> tuple[int, str, int]:
         now = utc_now()
         if self.repository.has_pending_new(criteria.content_hash):
             jobs = self.repository.next_new_jobs(
@@ -189,15 +218,23 @@ class ParkingScoreService:
 
         processed = 0
         published = 0
-        ready_jobs: list[Observation] = []
+        ready_jobs: list[tuple[Observation, str, datetime, str]] = []
         for observation in jobs:
             try:
                 self._ensure_cached_image(observation)
+                image_sha256 = hashlib.sha256(
+                    observation.cache_image_path.read_bytes()
+                ).hexdigest()
+                assessment_id, started_at = self.repository.begin_assessment(
+                    observation.id, criteria.content_hash
+                )
             except Exception as exc:  # noqa: BLE001 - isolate one failed job
                 self._record_processing_failure(observation, criteria, exc)
                 self._heartbeat()
             else:
-                ready_jobs.append(observation)
+                ready_jobs.append(
+                    (observation, assessment_id, started_at, image_sha256)
+                )
 
         worker_count = min(self.settings.ai_worker_threads, len(ready_jobs))
         if worker_count:
@@ -210,23 +247,49 @@ class ParkingScoreService:
             with ThreadPoolExecutor(
                 max_workers=worker_count, thread_name_prefix="ai-worker"
             ) as executor:
-                futures: dict[Future[Assessment], Observation] = {
-                    executor.submit(self._assess_observation, job, criteria): job
+                futures: dict[
+                    Future[Assessment], tuple[Observation, str, datetime, str]
+                ] = {
+                    executor.submit(self._assess_observation, job[0], criteria): job
                     for job in ready_jobs
                 }
                 for future in as_completed(futures):
-                    observation = futures[future]
+                    observation, assessment_id, started_at, image_sha256 = futures[
+                        future
+                    ]
                     try:
                         assessment = future.result()
+                        parameters = getattr(
+                            self.ai_client,
+                            "request_parameters",
+                            {
+                                "model": self.settings.ai_model,
+                                "temperature": self.settings.ai_temperature,
+                                "max_tokens": self.settings.ai_max_tokens,
+                            },
+                        )
                         self.repository.save_assessment(
-                            observation.id, criteria.content_hash, assessment
+                            observation.id,
+                            criteria,
+                            assessment,
+                            assessment_id=assessment_id,
+                            started_at=started_at,
+                            model_name=self.settings.ai_model,
+                            prompt_version=criteria.prompt_version,
+                            model_parameters=dict(parameters),
+                            mode="live",
+                            image_sha256=image_sha256,
                         )
                         processed += 1
-                        published += self._publish_outputs(criteria)
+                        published += self._publish_outputs(
+                            criteria, interval_minutes
+                        )
                         logger.info(
-                            "Image assessed path=%s probability=%d mode=%s",
+                            "Image assessed path=%s probability=%d "
+                            "assessment_id=%s mode=%s",
                             observation.image_path,
                             assessment.probability,
+                            assessment_id,
                             mode,
                         )
                     except Exception as exc:  # noqa: BLE001 - isolate one failed job
@@ -309,16 +372,22 @@ class ParkingScoreService:
         with self.ftp_factory(self.settings) as ftp:
             ftp.download_to(observation.image_path, observation.cache_image_path)
 
-    def _publish_outputs(self, criteria: CriteriaSet) -> int:
+    def _publish_outputs(
+        self,
+        criteria: CriteriaSet,
+        interval_minutes: int,
+    ) -> int:
         updates = self.repository.output_updates(
-            criteria.content_hash, self.settings.series_window_minutes
+            criteria.content_hash,
+            interval_minutes,
         )
         if not updates:
             return 0
         published = 0
         for update in updates:
             self.repository.set_latest_assessment_best(
-                update.observation_id, "best=true" in update.content
+                update.observation_id,
+                "best=true" in update.content.splitlines()[:2],
             )
         with self.ftp_factory(self.settings) as ftp:
             for update in updates:
@@ -327,11 +396,16 @@ class ParkingScoreService:
                         update.remote_path, update.content.encode("utf-8")
                     )
                     self.repository.mark_published(
-                        update.observation_id, update.content
+                        update.observation_id,
+                        update.content,
+                        update.remote_path,
                     )
                     published += 1
                     logger.info("Result published path=%s", update.remote_path)
-                except Exception:
+                except Exception as exc:
+                    self.repository.record_publication_failure(
+                        update.observation_id, update.remote_path, str(exc)
+                    )
                     logger.exception(
                         "Cannot publish result path=%s", update.remote_path
                     )

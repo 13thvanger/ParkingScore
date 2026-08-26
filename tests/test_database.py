@@ -2,6 +2,9 @@ import sqlite3
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
+from parking_score.criteria import CriteriaSet
 from parking_score.database import Repository
 from parking_score.models import Assessment, PhotoMetadata, RemoteFile, RemotePair
 
@@ -11,6 +14,9 @@ def _add(
     name: str,
     captured_at: datetime,
     discovered_at: datetime,
+    *,
+    place: str = "test address",
+    equipment_serial: str = "camera-1",
 ) -> int:
     pair = RemotePair(
         RemoteFile(f"/camera/{name}.jpg", 100, "20260801000000"),
@@ -19,13 +25,14 @@ def _add(
     metadata = PhotoMetadata(
         capture_id=name,
         plate="O716MP48",
-        place="test address",
+        place=place,
         camera="camera-1",
+        equipment_serial=equipment_serial,
         captured_at=captured_at,
         image_width=1920,
         image_height=1200,
         plate_box=None,
-        group_key="O716MP48\x1ftest address\x1fcamera-1",
+        group_key=f"O716MP48\x1f{equipment_serial}",
     )
     observation_id, _ = repository.upsert_observation(
         pair, metadata, Path(f"/tmp/{name}.jpg"), now=discovered_at
@@ -35,6 +42,115 @@ def _add(
 
 def _assessment(probability: int) -> Assessment:
     return Assessment(probability, [], "", "{}")
+
+
+def test_production_v1_database_migrates_to_contract_free_v2(tmp_path) -> None:
+    database = tmp_path / "v1.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            directory TEXT NOT NULL,
+            stem TEXT NOT NULL,
+            image_path TEXT NOT NULL UNIQUE,
+            xml_path TEXT NOT NULL,
+            pair_signature TEXT NOT NULL,
+            capture_id TEXT NOT NULL,
+            plate TEXT NOT NULL,
+            place TEXT NOT NULL,
+            camera TEXT NOT NULL,
+            captured_at TEXT NOT NULL,
+            discovered_at TEXT NOT NULL,
+            image_width INTEGER,
+            image_height INTEGER,
+            plate_x1 INTEGER,
+            plate_y1 INTEGER,
+            plate_x2 INTEGER,
+            plate_y2 INTEGER,
+            group_key TEXT NOT NULL,
+            series_id TEXT,
+            cache_image_path TEXT NOT NULL,
+            eligible INTEGER NOT NULL DEFAULT 0,
+            probability INTEGER,
+            criteria_details TEXT,
+            comment TEXT,
+            raw_response TEXT,
+            criteria_hash TEXT,
+            assessed_at TEXT,
+            needs_new_assessment INTEGER NOT NULL DEFAULT 1,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            attempt_criteria_hash TEXT,
+            retry_after TEXT,
+            failed_criteria_hash TEXT,
+            last_error TEXT,
+            published_content TEXT
+        );
+        CREATE TABLE assessment_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            observation_id INTEGER NOT NULL,
+            directory TEXT NOT NULL,
+            stem TEXT NOT NULL,
+            assessed_at TEXT NOT NULL,
+            probability INTEGER NOT NULL,
+            criteria_hash TEXT NOT NULL,
+            best INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'live',
+            UNIQUE(observation_id, assessed_at, criteria_hash),
+            FOREIGN KEY(observation_id) REFERENCES observations(id)
+        );
+        INSERT INTO observations (
+            directory, stem, image_path, xml_path, pair_signature, capture_id,
+            plate, place, camera, captured_at, discovered_at, group_key,
+            cache_image_path, eligible, probability, criteria_hash, assessed_at,
+            needs_new_assessment
+        ) VALUES (
+            '/camera', 'legacy', '/camera/legacy.jpg', '/camera/legacy.xml',
+            'image=100:old;xml=50:old', 'legacy-capture', 'A001AA48',
+            'legacy place', 'legacy-camera', '2026-08-01T10:00:00+00:00',
+            '2026-08-01T10:01:00+00:00', 'A001AA48\u001flegacy-camera',
+            '/tmp/legacy.jpg', 1, 55, 'legacy-criteria',
+            '2026-08-01T10:02:00+00:00', 0
+        );
+        INSERT INTO assessment_events (
+            observation_id, directory, stem, assessed_at, probability,
+            criteria_hash, best, source
+        ) VALUES (
+            1, '/camera', 'legacy', '2026-08-01T10:02:00+00:00', 55,
+            'legacy-criteria', 1, 'live'
+        );
+        """
+    )
+    connection.close()
+
+    repository = Repository(database)
+    try:
+        observation = repository.connection.execute(
+            "SELECT probability, send_probability FROM observations WHERE id=1"
+        ).fetchone()
+        event = repository.connection.execute(
+            "SELECT probability, send_probability FROM assessment_events WHERE id=1"
+        ).fetchone()
+        assert tuple(observation) == (55, 55)
+        assert tuple(event) == (55, 55)
+
+        for table in (
+            "observations",
+            "assessment_events",
+            "assessment_publications",
+        ):
+            columns = {
+                row["name"]
+                for row in repository.connection.execute(f"PRAGMA table_info({table})")
+            }
+            assert "series_contract_version" not in columns
+
+        with pytest.raises(sqlite3.DatabaseError, match="append-only"):
+            repository.connection.execute(
+                "UPDATE assessment_events SET probability=99 WHERE id=1"
+            )
+    finally:
+        repository.close()
 
 
 def test_pair_filter_version_invalidates_cached_decisions(tmp_path) -> None:
@@ -91,6 +207,139 @@ def test_series_use_gap_between_consecutive_photos(tmp_path) -> None:
         repository.close()
 
 
+def test_series_uses_bounded_total_span(tmp_path) -> None:
+    repository = Repository(tmp_path / "state.db")
+    start = datetime(2026, 8, 1, tzinfo=UTC)
+    try:
+        _add(repository, "late", start + timedelta(minutes=100), start)
+        _add(repository, "first", start, start, place="address A")
+        _add(
+            repository,
+            "middle",
+            start + timedelta(minutes=50),
+            start,
+            place="address B",
+        )
+
+        repository.rebuild_series(60)
+        rows = repository.connection.execute(
+            """
+            SELECT stem, series_id
+            FROM observations ORDER BY captured_at, source_key
+            """
+        ).fetchall()
+
+        assert rows[0]["series_id"] == rows[1]["series_id"]
+        assert rows[1]["series_id"] != rows[2]["series_id"]
+    finally:
+        repository.close()
+
+
+def test_different_equipment_serial_splits_series(tmp_path) -> None:
+    repository = Repository(tmp_path / "state.db")
+    start = datetime(2026, 8, 1, tzinfo=UTC)
+    try:
+        _add(repository, "a", start, start, equipment_serial="serial-a")
+        _add(repository, "b", start, start, equipment_serial="serial-b")
+
+        repository.rebuild_series(60)
+        rows = repository.connection.execute(
+            "SELECT series_id FROM observations ORDER BY source_key"
+        ).fetchall()
+
+        assert rows[0]["series_id"] != rows[1]["series_id"]
+    finally:
+        repository.close()
+
+
+def test_assessment_history_is_append_only_and_retry_keeps_uuid(tmp_path) -> None:
+    repository = Repository(tmp_path / "state.db")
+    started = datetime(2026, 8, 1, tzinfo=UTC)
+    try:
+        observation_id = _add(repository, "a", started, started)
+        repository.rebuild_series(60)
+        assessment_id, inference_started = repository.begin_assessment(
+            observation_id, "criteria-v1", started
+        )
+        repository.record_failure(
+            observation_id,
+            "criteria-v1",
+            "timeout",
+            max_attempts=3,
+            retry_base_seconds=1,
+            now=started,
+            allow_exhaustion=False,
+        )
+        retried_id, retried_started = repository.begin_assessment(
+            observation_id, "criteria-v1", started + timedelta(seconds=2)
+        )
+
+        assert retried_id == assessment_id
+        assert retried_started == inference_started
+
+        rich = Assessment(
+            82,
+            [{"id": "L01", "category": "lawn", "probability": 90}],
+            "ok",
+            '{"schema_version":2}',
+            lawn_probability=90,
+            evidence_quality_probability=70,
+            target_identity_probability=99,
+        )
+        saved_id = repository.save_assessment(
+            observation_id,
+            "criteria-v1",
+            rich,
+            started + timedelta(seconds=3),
+            assessment_id=assessment_id,
+            started_at=inference_started,
+            model_name="test-model",
+            model_parameters={"temperature": 0},
+        )
+        repository.set_latest_assessment_best(observation_id, True)
+        event = repository.connection.execute(
+            "SELECT * FROM assessment_events WHERE assessment_id=?",
+            (assessment_id,),
+        ).fetchone()
+
+        assert saved_id == assessment_id
+        assert event["send_probability"] == 82
+        assert event["lawn_probability"] == 90
+        assert event["model_name"] == "test-model"
+        assert event["best"] == 0
+        with pytest.raises(sqlite3.DatabaseError, match="append-only"):
+            repository.connection.execute(
+                "UPDATE assessment_events SET best=1 WHERE assessment_id=?",
+                (assessment_id,),
+            )
+    finally:
+        repository.close()
+
+
+def test_cursor_export_is_stable_and_contains_snapshots(tmp_path) -> None:
+    repository = Repository(tmp_path / "state.db")
+    started = datetime(2026, 8, 1, tzinfo=UTC)
+    try:
+        first = _add(repository, "a", started, started)
+        second = _add(repository, "b", started + timedelta(minutes=1), started)
+        repository.save_assessment(first, "criteria-v1", _assessment(40), started)
+        repository.save_assessment(second, "criteria-v1", _assessment(80), started)
+
+        first_page, cursor = repository.export_assessments(0, limit=1)
+        repeated, repeated_cursor = repository.export_assessments(0, limit=1)
+        second_page, final_cursor = repository.export_assessments(cursor, limit=1)
+
+        assert first_page == repeated
+        assert cursor == repeated_cursor == first_page[0]["event_id"]
+        assert second_page[0]["event_id"] > cursor
+        assert final_cursor == second_page[0]["event_id"]
+        assert "raw_response" in first_page[0]
+        assert "criteria_details" in first_page[0]
+        assert repository.export_assessments(final_cursor)[0] == []
+    finally:
+        repository.close()
+
+
 def test_best_is_published_only_after_quiet_window(tmp_path) -> None:
     repository = Repository(tmp_path / "state.db")
     started = datetime(2026, 8, 1, tzinfo=UTC)
@@ -105,6 +354,11 @@ def test_best_is_published_only_after_quiet_window(tmp_path) -> None:
             "criteria-v1", 15, started + timedelta(minutes=14)
         )
         assert all("best=false" in update.content for update in open_updates)
+        assert all("schema_version=2" in update.content for update in open_updates)
+        assert all(
+            "series_contract_version=" not in update.content
+            for update in open_updates
+        )
 
         closed_updates = repository.output_updates(
             "criteria-v1", 15, started + timedelta(minutes=16)
@@ -398,5 +652,49 @@ def test_preexisting_assessment_events_are_marked_legacy(tmp_path) -> None:
         assert len(updates) == 1
         assert updates[0].log_date == "19-08-2026"
         assert "old-fact" not in updates[0].content
+    finally:
+        repository.close()
+
+    # Simulate a rollback to the old worker, which can still append a row using
+    # only its legacy columns, then move forward to the aligned worker again.
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        """
+        INSERT INTO assessment_events (
+            observation_id, directory, stem, assessed_at,
+            probability, criteria_hash, best
+        ) VALUES (1, '/camera', 'rollback-fact',
+                  '2026-08-09T11:00:00+00:00', 65, 'criteria-v1', 0)
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    reopened = Repository(db_path)
+    try:
+        migrated = reopened.connection.execute(
+            "SELECT send_probability FROM assessment_events WHERE stem='rollback-fact'"
+        ).fetchone()
+        assert migrated["send_probability"] == 65
+    finally:
+        reopened.close()
+
+
+def test_previous_criteria_version_can_be_reactivated_for_rollback(tmp_path) -> None:
+    repository = Repository(tmp_path / "state.db")
+    first = CriteriaSet(("first",), "sha256:" + "1" * 64, version="v1")
+    second = CriteriaSet(("second",), "sha256:" + "2" * 64, version="v2")
+    try:
+        repository.register_criteria(first, activated=True)
+        repository.register_criteria(second, activated=True)
+        repository.register_criteria(first, activated=True)
+
+        active = repository.active_criteria()
+        rows = repository.connection.execute(
+            "SELECT version, retired_at FROM criteria_versions ORDER BY version"
+        ).fetchall()
+        assert active is not None and active["version"] == "v1"
+        assert rows[0]["retired_at"] is None
+        assert rows[1]["retired_at"] is not None
     finally:
         repository.close()

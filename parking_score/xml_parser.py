@@ -28,6 +28,7 @@ _CYRILLIC_PLATE_TRANSLATION = str.maketrans(
     }
 )
 ELIGIBLE_SIGN_CODES = frozenset({"1.01", "1.01.5", "1.01.6"})
+CANONICAL_SIGN = "1.01"
 
 
 def normalize_plate(value: str) -> str:
@@ -41,8 +42,18 @@ def normalize_text(value: str) -> str:
     return " ".join(value.replace("Ё", "Е").replace("ё", "е").split()).casefold()
 
 
-def has_required_sign(value: str | None) -> bool:
-    return value is not None and value.strip() in ELIGIBLE_SIGN_CODES
+def canonicalize_sign(
+    value: str | None, eligible_signs: frozenset[str] = ELIGIBLE_SIGN_CODES
+) -> str | None:
+    if value is None or value.strip() not in eligible_signs:
+        return None
+    return CANONICAL_SIGN
+
+
+def has_required_sign(
+    value: str | None, eligible_signs: frozenset[str] = ELIGIBLE_SIGN_CODES
+) -> bool:
+    return canonicalize_sign(value, eligible_signs) is not None
 
 
 def extract_sign(data: bytes) -> str | None:
@@ -114,6 +125,7 @@ def parse_recognition_xml(
 
     captured_at = _parse_datetime(_text(root, "CaptureInfo", "Date", required=True))
     sign = _text(root, "Sign") or None
+    canonical_sign = canonicalize_sign(sign)
     place = _text(root, "Address")
     if not place:
         latitude = _text(root, "Coordinates", "Latitude", required=True)
@@ -123,17 +135,12 @@ def parse_recognition_xml(
         except ValueError as exc:
             raise MetadataError("Invalid fallback coordinates") from exc
 
-    camera = _text(root, "CameraSerialNumber")
+    serial_number = _text(root, "SerialNumber") or None
+    camera_serial_number = _text(root, "CameraSerialNumber") or None
+    equipment_serial = serial_number or camera_serial_number
+    camera = camera_serial_number or serial_number or ""
     if not camera:
-        serial_number = _text(root, "SerialNumber")
-        position_camera = _text(root, "PositionCamera")
-        if serial_number:
-            camera = (
-                f"{serial_number}/position-{position_camera}"
-                if position_camera
-                else serial_number
-            )
-        elif fallback_camera and fallback_camera.strip():
+        if fallback_camera and fallback_camera.strip():
             camera = f"ftp:{fallback_camera.strip()}"
         else:
             raise MetadataError(
@@ -153,16 +160,18 @@ def parse_recognition_xml(
         if candidate.is_valid:
             plate_box = candidate
 
-    group_key = "\x1f".join((plate, normalize_text(place), normalize_text(camera)))
+    group_key = "\x1f".join((plate, equipment_serial or ""))
     return PhotoMetadata(
         capture_id=capture_id,
         plate=plate,
         place=place,
         camera=camera,
+        equipment_serial=equipment_serial,
         captured_at=captured_at,
         image_width=width,
         image_height=height,
         plate_box=plate_box,
         group_key=group_key,
         sign=sign,
+        canonical_sign=canonical_sign,
     )

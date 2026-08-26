@@ -50,27 +50,94 @@ def _extract_json_object(content: str) -> dict[str, Any]:
     raise AIError("AI response does not contain a JSON object")
 
 
-def parse_assessment(content: str) -> Assessment:
-    value = _extract_json_object(content)
-    probability = value.get("probability")
-    if isinstance(probability, bool) or not isinstance(probability, (int, float)):
-        raise AIError("AI response probability must be a number")
-    if not 0 <= float(probability) <= 100:
-        raise AIError("AI response probability must be between 0 and 100")
+def _probability(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise AIError(f"AI response {field} must be a number")
+    if not 0 <= float(value) <= 100:
+        raise AIError(f"AI response {field} must be between 0 and 100")
+    return round(float(value))
 
-    details = value.get("criteria", [])
+
+def parse_assessment(content: str, criteria: CriteriaSet) -> Assessment:
+    value = _extract_json_object(content)
+    if value.get("schema_version") != 2:
+        raise AIError("AI response schema_version must be 2")
+    send_probability = _probability(
+        value.get("send_probability"), "send_probability"
+    )
+    lawn_probability = _probability(
+        value.get("lawn_probability"), "lawn_probability"
+    )
+    evidence_probability = _probability(
+        value.get("evidence_quality_probability"),
+        "evidence_quality_probability",
+    )
+    identity_probability = _probability(
+        value.get("target_identity_probability"),
+        "target_identity_probability",
+    )
+
+    details = value.get("criteria")
     if not isinstance(details, list) or not all(
         isinstance(item, dict) for item in details
     ):
         raise AIError("AI response criteria must be an array of objects")
+    expected = {item.id: item for item in criteria.definitions}
+    normalized_details: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for detail in details:
+        criterion_id = detail.get("id")
+        if not isinstance(criterion_id, str) or criterion_id not in expected:
+            raise AIError(
+                f"AI response contains unknown criterion id: {criterion_id}"
+            )
+        if criterion_id in seen:
+            raise AIError(
+                f"AI response contains duplicate criterion id: {criterion_id}"
+            )
+        seen.add(criterion_id)
+        definition = expected[criterion_id]
+        if detail.get("category") != definition.category:
+            raise AIError(
+                f"AI response category mismatch for criterion {criterion_id}"
+            )
+        if not isinstance(detail.get("satisfied"), bool):
+            raise AIError(
+                f"AI response satisfied must be boolean for {criterion_id}"
+            )
+        evidence = detail.get("evidence")
+        if not isinstance(evidence, str):
+            raise AIError(
+                f"AI response evidence must be text for {criterion_id}"
+            )
+        normalized_details.append(
+            {
+                "id": criterion_id,
+                "category": definition.category,
+                "probability": _probability(
+                    detail.get("probability"),
+                    f"criteria[{criterion_id}].probability",
+                ),
+                "satisfied": detail["satisfied"],
+                "evidence": evidence,
+            }
+        )
+    missing = set(expected) - seen
+    if missing:
+        raise AIError(
+            "AI response is missing criteria: " + ", ".join(sorted(missing))
+        )
     comment = value.get("comment", "")
     if not isinstance(comment, str):
-        comment = str(comment)
+        raise AIError("AI response comment must be text")
     return Assessment(
-        probability=round(float(probability)),
-        criteria_details=details,
+        send_probability=send_probability,
+        criteria_details=normalized_details,
         comment=comment,
         raw_response=content,
+        lawn_probability=lawn_probability,
+        evidence_quality_probability=evidence_probability,
+        target_identity_probability=identity_probability,
     )
 
 
@@ -148,7 +215,7 @@ class AIClient:
                 "Content-Type": "application/json",
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 ParkingScore/0.1"
+                    "AppleWebKit/537.36 ParkingScore/0.2"
                 ),
             },
         )
@@ -185,7 +252,7 @@ class AIClient:
                     )
                 body = response.json()
                 content = _message_text(body)
-                return parse_assessment(content)
+                return parse_assessment(content, criteria)
             except _FatalAIError as exc:
                 raise AIError(str(exc)) from exc
             except (
@@ -248,9 +315,9 @@ class AIClient:
         criteria: CriteriaSet,
         image: PreparedImage,
     ) -> dict[str, Any]:
-        numbered = "\n".join(
-            f"{index}. {criterion}"
-            for index, criterion in enumerate(criteria.items, start=1)
+        structured = "\n".join(
+            f"[{criterion.category}:{criterion.id}] {criterion.text}"
+            for criterion in criteria.definitions
         )
         target_hint = (
             "Целевой автомобиль отмечен на изображении пурпурной рамкой вокруг "
@@ -263,18 +330,56 @@ class AIClient:
 {target_hint}
 Место фиксации: {observation.place}. Камера: {observation.camera}.
 
-Критерии:
-{numbered}
+Критерии с обязательными стабильными ID:
+{structured}
 
-Верни вероятность от 0 до 100 того, что целевой автомобиль одновременно
-соответствует всему списку критериев. Не подменяй целевой автомобиль соседним.
-Если важные детали не видны, снижай вероятность.
+Группы критериев имеют разный смысл и влияют на разные измерения:
+- lawn — только на lawn_probability: действительно ли целевой автомобиль
+  находится на озеленённой территории;
+- evidence — только на evidence_quality_probability: достаточно ли кадра для
+  подтверждения, независимо от того, есть ли нарушение. Учитывай техническое
+  качество фотографии: резкость, освещённость, пересветы и тёмные области,
+  блики и отражения, погодные помехи и перекрытия важных деталей;
+- identity — только на target_identity_probability: правильно ли выбран
+  автомобиль и относится ли к нему рамка TARGET/ГРЗ.
 
+Не переноси признаки с соседнего автомобиля на целевой. Отдельно оцени:
+- нахождение целевого автомобиля на озеленённой территории;
+- качество кадра как доказательства;
+- уверенность, что рамка TARGET и ГРЗ относятся именно к целевому автомобилю;
+- send_probability — вероятность, что этот фотофакт можно подтвердить и
+  отправить как нарушение lawnParking для указанного целевого автомобиля.
+  Это самостоятельная итоговая оценка с учётом трёх измерений и всех критериев,
+  а не среднее арифметическое остальных вероятностей.
+
+При оценке evidence хороший отдельный признак не должен компенсировать
+критический дефект: если из-за блика, темноты, пересвета, размытия или
+перекрытия нельзя уверенно увидеть автомобиль, колёса либо границу покрытия,
+существенно снижай evidence_quality_probability и send_probability.
+
+Считай фото «плохим фактом», если выполняется хотя бы одно условие:
+- техническое качество фотографии не позволяет надёжно оценить нарушение;
+- по визуальной оценке видно менее одной четверти целевого автомобиля.
+В этом случае существенно снижай evidence_quality_probability и
+send_probability. Не снижай lawn_probability только из-за плохого качества:
+положение на газоне в таком кадре считается не отрицательным, а неустановимым.
+
+Верни результат для каждого указанного ID. Все вероятности — числа 0..100.
 Ответь только JSON без Markdown по схеме:
 {{
-  "probability": 0,
+  "schema_version": 2,
+  "send_probability": 0,
+  "lawn_probability": 0,
+  "evidence_quality_probability": 0,
+  "target_identity_probability": 0,
   "criteria": [
-    {{"criterion": "текст критерия", "probability": 0, "satisfied": false}}
+    {{
+      "id": "ID критерия",
+      "category": "категория критерия",
+      "probability": 0,
+      "satisfied": false,
+      "evidence": "краткое наблюдение"
+    }}
   ],
   "comment": "краткое обоснование"
 }}
@@ -286,7 +391,8 @@ class AIClient:
                     "role": "system",
                     "content": (
                         "Ты эксперт по визуальной проверке парковки. "
-                        "Строго соблюдай формат ответа и оценивай только указанную машину."
+                        "Строго соблюдай формат ответа и оценивай только "
+                        "указанную машину."
                     ),
                 },
                 {
@@ -303,6 +409,16 @@ class AIClient:
             "stream": False,
             "temperature": self.settings.ai_temperature,
             "max_tokens": self.settings.ai_max_tokens,
+        }
+
+    @property
+    def request_parameters(self) -> dict[str, Any]:
+        """Reproducible request settings with no credentials or image data."""
+        return {
+            "model": self.settings.ai_model,
+            "temperature": self.settings.ai_temperature,
+            "max_tokens": self.settings.ai_max_tokens,
+            "stream": False,
         }
 
 

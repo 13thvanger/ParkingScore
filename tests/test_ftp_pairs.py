@@ -1,4 +1,5 @@
-from parking_score.ftp_client import build_pairs, parse_unix_list_line
+from parking_score.config import Settings
+from parking_score.ftp_client import FtpClient, build_pairs, parse_unix_list_line
 from parking_score.models import RemoteFile
 
 
@@ -38,3 +39,36 @@ def test_parse_unix_ftp_list_directory() -> None:
     assert parsed is not None
     assert parsed[0] == "DozorMA687"
     assert parsed[1]["type"] == "dir"
+
+
+def test_txt_upload_uses_temporary_name_then_rename() -> None:
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.files: dict[str, bytes] = {}
+            self.renames: list[tuple[str, str]] = []
+
+        def storbinary(self, command: str, stream) -> None:
+            self.files[command.removeprefix("STOR ")] = stream.read()
+
+        def rename(self, source: str, target: str) -> None:
+            self.renames.append((source, target))
+            self.files[target] = self.files.pop(source)
+
+    settings = Settings(
+        ftp_host="example",
+        ftp_port=21,
+        ftp_user="user",
+        ftp_password="not-real",
+    )
+    connection = FakeConnection()
+    client = FtpClient(settings)
+    client.ftp = connection  # type: ignore[assignment]
+
+    client.upload_atomic("/folder/fact.txt", b"probability=80\nbest=false\n")
+
+    assert connection.files == {
+        "/folder/fact.txt": b"probability=80\nbest=false\n"
+    }
+    temporary, target = connection.renames[0]
+    assert temporary.startswith("/folder/fact.txt.tmp-")
+    assert target == "/folder/fact.txt"

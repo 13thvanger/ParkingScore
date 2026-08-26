@@ -61,6 +61,14 @@ class FakeAI:
         return None
 
 
+def _service(settings, fake_ftp, fake_ai):
+    return ParkingScoreService(
+        settings,
+        ai_client=fake_ai,
+        ftp_factory=lambda unused: fake_ftp,
+    )
+
+
 class ConcurrentFakeAI(FakeAI):
     def __init__(self) -> None:
         super().__init__()
@@ -113,7 +121,7 @@ def _xml() -> bytes:
 
 def test_cycle_processes_pair_and_finalizes_best(tmp_path) -> None:
     criteria_path = tmp_path / "criteria.txt"
-    criteria_path.write_text("criterion one\n", encoding="utf-8")
+    criteria_path.write_text("[lawn]\ncriterion one\n", encoding="utf-8")
     settings = Settings(
         ftp_host="example",
         ftp_port=21,
@@ -121,6 +129,7 @@ def test_cycle_processes_pair_and_finalizes_best(tmp_path) -> None:
         ftp_password="password",
         ftp_root_dir="/root",
         ftp_stable_polls=1,
+        series_window_minutes=15,
         ai_api_key="key",
         criteria_file=criteria_path,
         state_db=tmp_path / "state.db",
@@ -128,16 +137,17 @@ def test_cycle_processes_pair_and_finalizes_best(tmp_path) -> None:
     )
     fake_ftp = FakeFtp(_xml(), _jpeg())
     fake_ai = FakeAI()
-    service = ParkingScoreService(
-        settings,
-        ai_client=fake_ai,
-        ftp_factory=lambda unused: fake_ftp,
-    )
+    service = _service(settings, fake_ftp, fake_ai)
     try:
         service.run_cycle()
         assert fake_ai.calls == 1
-        assert fake_ftp.uploaded["/root/photo-1.txt"] == (
-            b"probability=73\nbest=false\n"
+        first_txt = fake_ftp.uploaded["/root/photo-1.txt"].decode("utf-8")
+        assert first_txt.startswith("probability=73\nbest=false\nschema_version=2\n")
+        assert "series_contract_version=" not in first_txt
+        assessment_id = next(
+            line.removeprefix("assessment_id=")
+            for line in first_txt.splitlines()
+            if line.startswith("assessment_id=")
         )
         log_path = next(
             path for path in fake_ftp.uploaded if path.endswith(".log")
@@ -165,14 +175,16 @@ def test_cycle_processes_pair_and_finalizes_best(tmp_path) -> None:
             )
         service.run_cycle()
         assert fake_ai.calls == 1
-        assert fake_ftp.uploaded["/root/photo-1.txt"] == (
-            b"probability=73\nbest=true\n"
-        )
+        second_txt = fake_ftp.uploaded["/root/photo-1.txt"].decode("utf-8")
+        assert second_txt.startswith("probability=73\nbest=true\nschema_version=2\n")
+        assert f"assessment_id={assessment_id}\n" in second_txt
         assert "\t/root\tphoto-1\t73\ttrue\n" in (
             fake_ftp.uploaded[log_path].decode("utf-8")
         )
 
-        criteria_path.write_text("changed criterion\n", encoding="utf-8")
+        criteria_path.write_text(
+            "[lawn]\nchanged criterion\n", encoding="utf-8"
+        )
         fake_ftp.source["/root/photo-2.xml"] = _xml().replace(b"photo-1", b"photo-2")
         fake_ftp.source["/root/photo-2.jpg"] = _jpeg()
         service.run_cycle()
@@ -206,11 +218,7 @@ def test_cycle_assesses_images_concurrently(tmp_path) -> None:
     )
     fake_ftp.source["/root/photo-2.jpg"] = _jpeg()
     fake_ai = ConcurrentFakeAI()
-    service = ParkingScoreService(
-        settings,
-        ai_client=fake_ai,
-        ftp_factory=lambda unused: fake_ftp,
-    )
+    service = _service(settings, fake_ftp, fake_ai)
     try:
         service.run_cycle()
 
@@ -239,11 +247,7 @@ def test_transient_ai_error_stays_in_queue(tmp_path) -> None:
         cache_dir=tmp_path / "cache",
     )
     fake_ftp = FakeFtp(_xml(), _jpeg())
-    service = ParkingScoreService(
-        settings,
-        ai_client=TransientFakeAI(),
-        ftp_factory=lambda unused: fake_ftp,
-    )
+    service = _service(settings, fake_ftp, TransientFakeAI())
     try:
         service.run_cycle()
         row = service.repository.connection.execute(
@@ -253,6 +257,41 @@ def test_transient_ai_error_stays_in_queue(tmp_path) -> None:
         assert row["failed_criteria_hash"] is None
         assert row["retry_after"] is not None
         assert row["needs_new_assessment"] == 1
+    finally:
+        service.close()
+
+
+def test_service_publishes_txt_without_external_contract(tmp_path) -> None:
+    criteria_path = tmp_path / "criteria.txt"
+    criteria_path.write_text("criterion one\n", encoding="utf-8")
+    settings = Settings(
+        ftp_host="example",
+        ftp_port=21,
+        ftp_user="user",
+        ftp_password="password",
+        ftp_root_dir="/root",
+        ftp_stable_polls=1,
+        ai_api_key="key",
+        criteria_file=criteria_path,
+        state_db=tmp_path / "state.db",
+        cache_dir=tmp_path / "cache",
+    )
+    fake_ftp = FakeFtp(_xml(), _jpeg())
+    fake_ai = FakeAI()
+    service = _service(settings, fake_ftp, fake_ai)
+    try:
+        service.run_cycle()
+
+        assert fake_ai.calls == 1
+        assert "/root/photo-1.txt" in fake_ftp.uploaded
+        content = fake_ftp.uploaded["/root/photo-1.txt"].decode("utf-8")
+        assert "schema_version=2\n" in content
+        assert "series_contract_version=" not in content
+        row = service.repository.connection.execute(
+            "SELECT assessment_id, send_probability FROM observations LIMIT 1"
+        ).fetchone()
+        assert row["assessment_id"] is not None
+        assert row["send_probability"] == 73
     finally:
         service.close()
 
@@ -292,11 +331,7 @@ def test_cycle_accepts_parking_sign_codes_and_excludes_other(tmp_path) -> None:
     )
     fake_ftp.source["/root/photo-4.jpg"] = _jpeg()
     fake_ai = FakeAI()
-    service = ParkingScoreService(
-        settings,
-        ai_client=fake_ai,
-        ftp_factory=lambda unused: fake_ftp,
-    )
+    service = _service(settings, fake_ftp, fake_ai)
     try:
         service.run_cycle()
 
@@ -339,11 +374,7 @@ def test_changed_sign_deactivates_existing_observation(tmp_path) -> None:
     )
     fake_ftp = FakeFtp(_xml(), _jpeg())
     fake_ai = FakeAI()
-    service = ParkingScoreService(
-        settings,
-        ai_client=fake_ai,
-        ftp_factory=lambda unused: fake_ftp,
-    )
+    service = _service(settings, fake_ftp, fake_ai)
     try:
         service.run_cycle()
         assert fake_ai.calls == 1

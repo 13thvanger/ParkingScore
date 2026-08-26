@@ -45,12 +45,14 @@ class PhotoMetadata:
     plate: str
     place: str
     camera: str
+    equipment_serial: str | None
     captured_at: datetime
     image_width: int | None
     image_height: int | None
     plate_box: PlateBox | None
     group_key: str
     sign: str | None = None
+    canonical_sign: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,12 +60,17 @@ class Observation:
     id: int
     directory: str
     stem: str
+    source_key: str
     image_path: str
     xml_path: str
     pair_signature: str
+    capture_id: str
     plate: str
     place: str
     camera: str
+    equipment_serial: str | None
+    sign: str | None
+    canonical_sign: str | None
     captured_at: datetime
     discovered_at: datetime
     image_width: int | None
@@ -71,10 +78,25 @@ class Observation:
     plate_box: PlateBox | None
     group_key: str
     series_id: str | None
-    probability: int | None
+    send_probability: int | None
+    lawn_probability: int | None
+    evidence_quality_probability: int | None
+    target_identity_probability: int | None
+    assessment_id: str | None
     criteria_hash: str | None
+    criteria_version: str | None
+    prompt_version: str | None
+    model_name: str | None
+    current_best: bool
     needs_new_assessment: bool
+    pending_assessment_id: str | None
+    pending_started_at: datetime | None
     cache_image_path: Path
+
+    @property
+    def probability(self) -> int | None:
+        """Backward-compatible alias for the legacy scoring name."""
+        return self.send_probability
 
     @property
     def output_path(self) -> str:
@@ -85,10 +107,19 @@ class Observation:
 
 @dataclass(frozen=True, slots=True)
 class Assessment:
-    probability: int
+    send_probability: int
     criteria_details: list[dict[str, Any]]
     comment: str
     raw_response: str
+    lawn_probability: int | None = None
+    evidence_quality_probability: int | None = None
+    target_identity_probability: int | None = None
+    schema_version: int = 2
+
+    @property
+    def probability(self) -> int:
+        """Keep old callers and log formatting compatible."""
+        return self.send_probability
 
 
 @dataclass(frozen=True, slots=True)
