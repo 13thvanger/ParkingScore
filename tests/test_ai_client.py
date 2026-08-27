@@ -11,7 +11,7 @@ from parking_score.ai_client import (
     parse_assessment,
 )
 from parking_score.config import Settings
-from parking_score.criteria import CriteriaSet
+from parking_score.criteria import CriteriaSet, Criterion
 from parking_score.image_processor import PreparedImage
 
 
@@ -76,6 +76,55 @@ def test_parse_assessment_accepts_fenced_v2_json() -> None:
     assert result.evidence_quality_probability == 70
     assert result.target_identity_probability == 99
     assert result.comment == "ok"
+
+
+@pytest.mark.parametrize(
+    ("returned_id", "returned_category"),
+    [
+        ("decision:LEGACY001", "decision"),
+        ("LEGACY001", "lawn"),
+        ("lawn:LEGACY001", "lawn"),
+    ],
+)
+def test_parse_assessment_normalizes_legacy_model_variants(
+    returned_id: str, returned_category: str
+) -> None:
+    value = json.loads(_response(criterion_id=returned_id))
+    value["criteria"][0]["category"] = returned_category
+
+    result = parse_assessment(json.dumps(value), _criteria())
+
+    assert result.criteria_details[0]["id"] == "LEGACY001"
+    assert result.criteria_details[0]["category"] == "decision"
+
+
+def test_parse_assessment_keeps_grouped_criteria_strict() -> None:
+    grouped = CriteriaSet(
+        items=("criterion",),
+        content_hash="sha256:" + "2" * 64,
+        definitions=(Criterion("L01", "lawn", "criterion"),),
+    )
+    value = json.loads(_response(criterion_id="L01"))
+    value["criteria"][0]["category"] = "evidence"
+
+    with pytest.raises(AIError, match="category mismatch"):
+        parse_assessment(json.dumps(value), grouped)
+
+
+def test_parse_assessment_normalizes_qualified_grouped_id() -> None:
+    criterion_id = "L-029631E9C34E"
+    grouped = CriteriaSet(
+        items=("criterion",),
+        content_hash="sha256:" + "3" * 64,
+        definitions=(Criterion(criterion_id, "lawn", "criterion"),),
+    )
+    value = json.loads(_response(criterion_id=f"lawn:{criterion_id}"))
+    value["criteria"][0]["category"] = "lawn"
+
+    result = parse_assessment(json.dumps(value), grouped)
+
+    assert result.criteria_details[0]["id"] == criterion_id
+    assert result.criteria_details[0]["category"] == "lawn"
 
 
 def test_parse_assessment_rejects_missing_or_out_of_range_probability() -> None:
@@ -153,6 +202,48 @@ def test_client_reports_non_text_response_shape_as_transient() -> None:
         client.close()
 
 
+def test_client_increases_max_tokens_after_length_response() -> None:
+    requested_limits: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requested_limits.append(body["max_tokens"])
+        if len(requested_limits) < 3:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": None,
+                                "reasoning": "hidden",
+                                "tool_calls": [],
+                            },
+                            "finish_reason": "length",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": _response(61)}}]},
+        )
+
+    client = AIClient(
+        _settings(
+            ai_request_retries=3,
+            ai_max_tokens=1000,
+            ai_length_retry_max_tokens=4000,
+        ),
+        httpx.MockTransport(handler),
+    )
+    try:
+        assert _assess(client).probability == 61
+        assert requested_limits == [1000, 2000, 4000]
+    finally:
+        client.close()
+
+
 def test_client_retries_429_and_then_succeeds() -> None:
     calls = 0
 
@@ -202,7 +293,9 @@ def test_prompt_names_target_dimensions_and_stable_criteria_id() -> None:
     assert "O716MP48" in prompt
     assert "TARGET" in prompt
     assert "send_probability" in prompt
-    assert "[decision:LEGACY001]" in prompt
+    assert '"id": "LEGACY001"' in prompt
+    assert '"category": "decision"' in prompt
+    assert "без префикса категории" in prompt
     assert "lawn — только на lawn_probability" in prompt
     assert "evidence — только на evidence_quality_probability" in prompt
     assert "identity — только на target_identity_probability" in prompt
@@ -212,3 +305,4 @@ def test_prompt_names_target_dimensions_and_stable_criteria_id() -> None:
     assert "видно менее одной четверти целевого автомобиля" in prompt
     assert "считается не отрицательным, а неустановимым" in prompt
     assert "key" not in json.dumps(client.request_parameters)
+    assert client.request_parameters["length_retry_max_tokens"] == 4000

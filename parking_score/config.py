@@ -84,6 +84,7 @@ class Settings:
     ai_retry_jitter_seconds: float = 3.0
     ai_temperature: float = 0.0
     ai_max_tokens: int = 1000
+    ai_length_retry_max_tokens: int = 4000
     ai_image_max_dimension: int = 1920
     ai_image_jpeg_quality: int = 88
     ai_image_max_bytes: int = 5_000_000
@@ -122,6 +123,14 @@ class Settings:
         if ai_retry_max_seconds < ai_retry_base_seconds:
             raise ConfigurationError(
                 "AI_RETRY_MAX_SECONDS must be >= AI_RETRY_BASE_SECONDS"
+            )
+        ai_max_tokens = _integer("AI_MAX_TOKENS", 1000)
+        ai_length_retry_max_tokens = _integer(
+            "AI_LENGTH_RETRY_MAX_TOKENS", max(4000, ai_max_tokens)
+        )
+        if ai_length_retry_max_tokens < ai_max_tokens:
+            raise ConfigurationError(
+                "AI_LENGTH_RETRY_MAX_TOKENS must be >= AI_MAX_TOKENS"
             )
         assessment_log_timezone = (
             os.getenv("ASSESSMENT_LOG_TIMEZONE", "Europe/Moscow").strip()
@@ -169,7 +178,8 @@ class Settings:
             ai_retry_max_seconds=ai_retry_max_seconds,
             ai_retry_jitter_seconds=_floating("AI_RETRY_JITTER_SECONDS", 3.0),
             ai_temperature=_floating("AI_TEMPERATURE", 0.0),
-            ai_max_tokens=_integer("AI_MAX_TOKENS", 1000),
+            ai_max_tokens=ai_max_tokens,
+            ai_length_retry_max_tokens=ai_length_retry_max_tokens,
             ai_image_max_dimension=_integer("AI_IMAGE_MAX_DIMENSION", 1920, 320),
             ai_image_jpeg_quality=quality,
             ai_image_max_bytes=_integer("AI_IMAGE_MAX_BYTES", 5_000_000, 100_000),

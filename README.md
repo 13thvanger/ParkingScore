@@ -206,6 +206,8 @@ docker compose logs -f parking-score
 | `MAX_REPROCESS_JOBS_PER_CYCLE` | `1` | фоновая переоценка за цикл |
 | `AI_WORKER_THREADS` | `4` | параллельные AI-запросы |
 | `AI_REQUESTS_PER_MINUTE` | `6` | общий rate limit; `0` отключает |
+| `AI_MAX_TOKENS` | `1000` | лимит первого AI-запроса |
+| `AI_LENGTH_RETRY_MAX_TOKENS` | `4000` | предел увеличения лимита при `finish_reason=length` |
 | `CRITERIA_FILE` | `criteria.txt` | активные критерии |
 
 ## Проверка и откат

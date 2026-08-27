@@ -27,6 +27,12 @@ class AITransientError(AIError):
     """Raised when an assessment should be retried without permanent failure."""
 
 
+class _UnusableMessageError(AIError):
+    def __init__(self, message: str, finish_reason: str | None = None) -> None:
+        super().__init__(message)
+        self.finish_reason = finish_reason
+
+
 def _extract_json_object(content: str) -> dict[str, Any]:
     cleaned = content.strip()
     if cleaned.startswith("```"):
@@ -86,10 +92,11 @@ def parse_assessment(content: str, criteria: CriteriaSet) -> Assessment:
     normalized_details: list[dict[str, Any]] = []
     seen: set[str] = set()
     for detail in details:
-        criterion_id = detail.get("id")
-        if not isinstance(criterion_id, str) or criterion_id not in expected:
+        returned_id = detail.get("id")
+        criterion_id = _canonical_criterion_id(returned_id, expected)
+        if criterion_id is None:
             raise AIError(
-                f"AI response contains unknown criterion id: {criterion_id}"
+                f"AI response contains unknown criterion id: {returned_id}"
             )
         if criterion_id in seen:
             raise AIError(
@@ -97,7 +104,13 @@ def parse_assessment(content: str, criteria: CriteriaSet) -> Assessment:
             )
         seen.add(criterion_id)
         definition = expected[criterion_id]
-        if detail.get("category") != definition.category:
+        returned_category = detail.get("category")
+        allowed_categories = (
+            {"decision", "lawn", "evidence", "identity"}
+            if definition.category == "decision"
+            else {definition.category}
+        )
+        if returned_category not in allowed_categories:
             raise AIError(
                 f"AI response category mismatch for criterion {criterion_id}"
             )
@@ -141,6 +154,26 @@ def parse_assessment(content: str, criteria: CriteriaSet) -> Assessment:
     )
 
 
+def _canonical_criterion_id(
+    value: Any, expected: dict[str, Any]
+) -> str | None:
+    """Accept an exact ID or the unambiguous ``category:ID`` model variant."""
+    if not isinstance(value, str):
+        return None
+    if value in expected:
+        return value
+    category, separator, criterion_id = value.partition(":")
+    if not separator or criterion_id not in expected:
+        return None
+    definition = expected[criterion_id]
+    if category == definition.category or (
+        definition.category == "decision"
+        and category in {"lawn", "evidence", "identity"}
+    ):
+        return criterion_id
+    return None
+
+
 def _message_text(body: Any) -> str:
     try:
         choice = body["choices"][0]
@@ -173,13 +206,15 @@ def _message_text(body: Any) -> str:
 
     tool_calls = message.get("tool_calls")
     tool_call_count = len(tool_calls) if isinstance(tool_calls, list) else 0
-    raise AIError(
+    finish_reason = choice.get("finish_reason")
+    raise _UnusableMessageError(
         "AI response message content is not usable "
         f"(content_type={type(content).__name__}, "
-        f"finish_reason={choice.get('finish_reason')!r}, "
+        f"finish_reason={finish_reason!r}, "
         f"refusal={bool(message.get('refusal'))}, "
         f"tool_calls={tool_call_count}, "
-        f"reasoning={isinstance(message.get('reasoning'), str)})"
+        f"reasoning={isinstance(message.get('reasoning'), str)})",
+        finish_reason=finish_reason if isinstance(finish_reason, str) else None,
     )
 
 
@@ -265,18 +300,45 @@ class AIClient:
                 last_error = exc
                 if attempt >= self.settings.ai_request_retries:
                     break
+                next_max_tokens = self._increase_token_limit_after_length(
+                    payload, exc
+                )
                 delay = self._retry_delay(attempt, exc)
                 if isinstance(exc, _RetryableAIError) and exc.global_cooldown:
                     self._extend_global_cooldown(delay)
                 logger.warning(
-                    "AI request attempt %d/%d failed; retrying in %.1fs: %s",
+                    "AI request attempt %d/%d failed; retrying in %.1fs%s: %s",
                     attempt,
                     self.settings.ai_request_retries,
                     delay,
+                    (
+                        f" with max_tokens={next_max_tokens}"
+                        if next_max_tokens is not None
+                        else ""
+                    ),
                     exc,
                 )
                 time.sleep(delay)
         raise AITransientError(f"AI request failed after retries: {last_error}")
+
+    def _increase_token_limit_after_length(
+        self, payload: dict[str, Any], error: Exception
+    ) -> int | None:
+        if not (
+            isinstance(error, _UnusableMessageError)
+            and error.finish_reason == "length"
+        ):
+            return None
+        current = int(payload["max_tokens"])
+        ceiling = max(
+            self.settings.ai_max_tokens,
+            self.settings.ai_length_retry_max_tokens,
+        )
+        if current >= ceiling:
+            return None
+        increased = min(ceiling, max(current + 1, current * 2))
+        payload["max_tokens"] = increased
+        return increased
 
     def _wait_for_request_slot(self) -> None:
         requests_per_minute = self.settings.ai_requests_per_minute
@@ -316,7 +378,14 @@ class AIClient:
         image: PreparedImage,
     ) -> dict[str, Any]:
         structured = "\n".join(
-            f"[{criterion.category}:{criterion.id}] {criterion.text}"
+            json.dumps(
+                {
+                    "id": criterion.id,
+                    "category": criterion.category,
+                    "criterion": criterion.text,
+                },
+                ensure_ascii=False,
+            )
             for criterion in criteria.definitions
         )
         target_hint = (
@@ -342,6 +411,8 @@ class AIClient:
   блики и отражения, погодные помехи и перекрытия важных деталей;
 - identity — только на target_identity_probability: правильно ли выбран
   автомобиль и относится ли к нему рамка TARGET/ГРЗ.
+- decision — совместимый формат старого criteria.txt без групп. Это общие
+  правила итогового решения; для них сохрани category="decision".
 
 Не переноси признаки с соседнего автомобиля на целевой. Отдельно оцени:
 - нахождение целевого автомобиля на озеленённой территории;
@@ -364,7 +435,11 @@ class AIClient:
 send_probability. Не снижай lawn_probability только из-за плохого качества:
 положение на газоне в таком кадре считается не отрицательным, а неустановимым.
 
-Верни результат для каждого указанного ID. Все вероятности — числа 0..100.
+Верни результат для каждого указанного ID. В поле id копируй только значение
+поля id из списка критериев, без префикса категории (например, LEGACY001, а не
+decision:LEGACY001). В поле category точно копируй соответствующее значение
+category. Все вероятности — числа 0..100. Evidence и comment должны быть
+краткими. Не выводи ход рассуждений.
 Ответь только JSON без Markdown по схеме:
 {{
   "schema_version": 2,
@@ -418,6 +493,9 @@ send_probability. Не снижай lawn_probability только из-за пл
             "model": self.settings.ai_model,
             "temperature": self.settings.ai_temperature,
             "max_tokens": self.settings.ai_max_tokens,
+            "length_retry_max_tokens": (
+                self.settings.ai_length_retry_max_tokens
+            ),
             "stream": False,
         }
 
