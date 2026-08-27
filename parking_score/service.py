@@ -15,7 +15,7 @@ from .config import Settings
 from .criteria import CriteriaError, CriteriaSet, load_criteria
 from .database import Repository, to_iso, utc_now
 from .ftp_client import FtpClient, build_pairs
-from .image_processor import prepare_image
+from .image_processor import ImageDecodeError, PreparedImage, prepare_image
 from .models import Assessment, Observation
 from .xml_parser import (
     ELIGIBLE_SIGN_CODES,
@@ -218,13 +218,10 @@ class ParkingScoreService:
 
         processed = 0
         published = 0
-        ready_jobs: list[tuple[Observation, str, datetime, str]] = []
+        ready_jobs: list[tuple[Observation, str, datetime]] = []
         for observation in jobs:
             try:
                 self._ensure_cached_image(observation)
-                image_sha256 = hashlib.sha256(
-                    observation.cache_image_path.read_bytes()
-                ).hexdigest()
                 assessment_id, started_at = self.repository.begin_assessment(
                     observation.id, criteria.content_hash
                 )
@@ -232,9 +229,7 @@ class ParkingScoreService:
                 self._record_processing_failure(observation, criteria, exc)
                 self._heartbeat()
             else:
-                ready_jobs.append(
-                    (observation, assessment_id, started_at, image_sha256)
-                )
+                ready_jobs.append((observation, assessment_id, started_at))
 
         worker_count = min(self.settings.ai_worker_threads, len(ready_jobs))
         if worker_count:
@@ -248,17 +243,16 @@ class ParkingScoreService:
                 max_workers=worker_count, thread_name_prefix="ai-worker"
             ) as executor:
                 futures: dict[
-                    Future[Assessment], tuple[Observation, str, datetime, str]
+                    Future[tuple[Assessment, str]],
+                    tuple[Observation, str, datetime],
                 ] = {
                     executor.submit(self._assess_observation, job[0], criteria): job
                     for job in ready_jobs
                 }
                 for future in as_completed(futures):
-                    observation, assessment_id, started_at, image_sha256 = futures[
-                        future
-                    ]
+                    observation, assessment_id, started_at = futures[future]
                     try:
-                        assessment = future.result()
+                        assessment, image_sha256 = future.result()
                         parameters = getattr(
                             self.ai_client,
                             "request_parameters",
@@ -331,15 +325,37 @@ class ParkingScoreService:
 
     def _assess_observation(
         self, observation: Observation, criteria: CriteriaSet
-    ) -> Assessment:
-        prepared = prepare_image(
+    ) -> tuple[Assessment, str]:
+        try:
+            prepared = self._prepare_cached_image(observation)
+        except ImageDecodeError as exc:
+            logger.warning(
+                "Cached image cannot be decoded; downloading once more path=%s "
+                "error=%s",
+                observation.image_path,
+                exc,
+            )
+            observation.cache_image_path.unlink(missing_ok=True)
+            self._ensure_cached_image(observation)
+            try:
+                prepared = self._prepare_cached_image(observation)
+            except ImageDecodeError:
+                observation.cache_image_path.unlink(missing_ok=True)
+                raise
+        image_sha256 = hashlib.sha256(
+            observation.cache_image_path.read_bytes()
+        ).hexdigest()
+        assessment = self.ai_client.assess(observation, criteria, prepared)
+        return assessment, image_sha256
+
+    def _prepare_cached_image(self, observation: Observation) -> PreparedImage:
+        return prepare_image(
             str(observation.cache_image_path),
             observation,
             self.settings.ai_image_max_dimension,
             self.settings.ai_image_jpeg_quality,
             self.settings.ai_image_max_bytes,
         )
-        return self.ai_client.assess(observation, criteria, prepared)
 
     def _record_processing_failure(
         self, observation: Observation, criteria: CriteriaSet, error: Exception

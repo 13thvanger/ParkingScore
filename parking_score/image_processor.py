@@ -13,6 +13,10 @@ class ImagePreparationError(ValueError):
     """Raised when an image cannot be prepared for the AI API."""
 
 
+class ImageDecodeError(ImagePreparationError):
+    """Raised when source bytes are not a decodable image."""
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedImage:
     data_url: str
@@ -69,7 +73,7 @@ def prepare_image(
             source.load()
             image = ImageOps.exif_transpose(source).convert("RGB")
     except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
-        raise ImagePreparationError(f"Cannot decode image: {exc}") from exc
+        raise ImageDecodeError(f"Cannot decode image: {exc}") from exc
 
     if max(image.size) > max_dimension:
         ratio = max_dimension / max(image.size)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import threading
 import time
@@ -23,6 +24,7 @@ class FakeFtp:
             "/root/photo-1.jpg": image,
         }
         self.uploaded: dict[str, bytes] = {}
+        self.downloaded: list[str] = []
 
     def __enter__(self) -> Self:
         return self
@@ -40,6 +42,7 @@ class FakeFtp:
         return self.source[path]
 
     def download_to(self, path: str, local_path: Path) -> None:
+        self.downloaded.append(path)
         local_path.parent.mkdir(parents=True, exist_ok=True)
         local_path.write_bytes(self.source[path])
 
@@ -226,6 +229,78 @@ def test_cycle_assesses_images_concurrently(tmp_path) -> None:
         assert fake_ai.max_active == 2
         assert "/root/photo-1.txt" in fake_ftp.uploaded
         assert "/root/photo-2.txt" in fake_ftp.uploaded
+    finally:
+        service.close()
+
+
+def test_corrupt_cached_image_is_downloaded_again_before_assessment(tmp_path) -> None:
+    criteria_path = tmp_path / "criteria.txt"
+    criteria_path.write_text("criterion one\n", encoding="utf-8")
+    settings = Settings(
+        ftp_host="example",
+        ftp_port=21,
+        ftp_user="user",
+        ftp_password="password",
+        ftp_root_dir="/root",
+        ftp_stable_polls=1,
+        ai_api_key="key",
+        criteria_file=criteria_path,
+        state_db=tmp_path / "state.db",
+        cache_dir=tmp_path / "cache",
+    )
+    cached_image = settings.cache_dir / "root" / "photo-1.jpg"
+    cached_image.parent.mkdir(parents=True)
+    cached_image.write_bytes(b"not an image")
+    valid_image = _jpeg()
+    fake_ftp = FakeFtp(_xml(), valid_image)
+    fake_ai = FakeAI()
+    service = _service(settings, fake_ftp, fake_ai)
+    try:
+        service.run_cycle()
+
+        assert fake_ftp.downloaded == ["/root/photo-1.jpg"]
+        assert cached_image.read_bytes() == valid_image
+        assert fake_ai.calls == 1
+        assert "/root/photo-1.txt" in fake_ftp.uploaded
+        event = service.repository.connection.execute(
+            "SELECT image_sha256 FROM assessment_events LIMIT 1"
+        ).fetchone()
+        assert event["image_sha256"] == hashlib.sha256(valid_image).hexdigest()
+    finally:
+        service.close()
+
+
+def test_invalid_ftp_image_is_retried_once_and_removed_from_cache(tmp_path) -> None:
+    criteria_path = tmp_path / "criteria.txt"
+    criteria_path.write_text("criterion one\n", encoding="utf-8")
+    settings = Settings(
+        ftp_host="example",
+        ftp_port=21,
+        ftp_user="user",
+        ftp_password="password",
+        ftp_root_dir="/root",
+        ftp_stable_polls=1,
+        ai_api_key="key",
+        criteria_file=criteria_path,
+        state_db=tmp_path / "state.db",
+        cache_dir=tmp_path / "cache",
+    )
+    fake_ftp = FakeFtp(_xml(), b"not an image")
+    fake_ai = FakeAI()
+    service = _service(settings, fake_ftp, fake_ai)
+    try:
+        service.run_cycle()
+
+        assert fake_ftp.downloaded == [
+            "/root/photo-1.jpg",
+            "/root/photo-1.jpg",
+        ]
+        assert fake_ai.calls == 0
+        assert not (settings.cache_dir / "root" / "photo-1.jpg").exists()
+        row = service.repository.connection.execute(
+            "SELECT attempt_count, needs_new_assessment FROM observations LIMIT 1"
+        ).fetchone()
+        assert tuple(row) == (1, 1)
     finally:
         service.close()
 
