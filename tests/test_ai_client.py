@@ -78,6 +78,38 @@ def test_parse_assessment_accepts_fenced_v2_json() -> None:
     assert result.comment == "ok"
 
 
+@pytest.mark.parametrize("schema_version", [2, 2.0, "2", " 2 "])
+def test_parse_assessment_accepts_numeric_and_string_v2_schema(
+    schema_version: float | str,
+) -> None:
+    value = json.loads(_response())
+    value["schema_version"] = schema_version
+
+    result = parse_assessment(json.dumps(value), _criteria())
+
+    assert result.send_probability == 73
+
+
+def test_schema_version_error_contains_only_safe_shape_diagnostics() -> None:
+    private_marker = "O716MP48 private address"
+    value = json.loads(_response())
+    value["schema_version"] = private_marker
+    value.pop("send_probability")
+    value["unexpected_private_field"] = private_marker
+
+    with pytest.raises(AIError) as captured:
+        parse_assessment(json.dumps(value), _criteria())
+
+    message = str(captured.value)
+    assert "status=string_not_2" in message
+    assert "value_type=str" in message
+    assert "required_fields_present=6/7" in message
+    assert "missing_fields=send_probability" in message
+    assert "unknown_fields=1" in message
+    assert private_marker not in message
+    assert "unexpected_private_field" not in message
+
+
 @pytest.mark.parametrize(
     ("returned_id", "returned_category"),
     [

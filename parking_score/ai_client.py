@@ -18,6 +18,16 @@ from .models import Assessment, Observation
 
 logger = logging.getLogger(__name__)
 
+_ASSESSMENT_V2_FIELDS = (
+    "schema_version",
+    "send_probability",
+    "lawn_probability",
+    "evidence_quality_probability",
+    "target_identity_probability",
+    "criteria",
+    "comment",
+)
+
 
 class AIError(RuntimeError):
     """Raised when the AI service cannot produce a valid assessment."""
@@ -64,10 +74,51 @@ def _probability(value: Any, field: str) -> int:
     return round(float(value))
 
 
+def _validate_schema_version(value: dict[str, Any]) -> None:
+    raw_version = value.get("schema_version")
+    numeric_v2 = (
+        not isinstance(raw_version, bool)
+        and isinstance(raw_version, (int, float))
+        and raw_version == 2
+    )
+    string_v2 = (
+        isinstance(raw_version, str) and raw_version.strip() == "2"
+    )
+    if numeric_v2 or string_v2:
+        return
+
+    if "schema_version" not in value:
+        status = "missing"
+    elif raw_version is None:
+        status = "null"
+    elif isinstance(raw_version, bool):
+        status = "boolean_not_2"
+    elif isinstance(raw_version, str):
+        status = "string_not_2"
+    elif isinstance(raw_version, (int, float)):
+        status = "number_not_2"
+    else:
+        status = "unsupported_type"
+
+    present_count = sum(field in value for field in _ASSESSMENT_V2_FIELDS)
+    missing_fields = [
+        field for field in _ASSESSMENT_V2_FIELDS if field not in value
+    ]
+    unknown_count = sum(
+        field not in _ASSESSMENT_V2_FIELDS for field in value
+    )
+    raise AIError(
+        'AI response schema_version must be 2 or "2" '
+        f"(status={status}, value_type={type(raw_version).__name__}, "
+        f"required_fields_present={present_count}/{len(_ASSESSMENT_V2_FIELDS)}, "
+        f"missing_fields={','.join(missing_fields) or 'none'}, "
+        f"unknown_fields={unknown_count})"
+    )
+
+
 def parse_assessment(content: str, criteria: CriteriaSet) -> Assessment:
     value = _extract_json_object(content)
-    if value.get("schema_version") != 2:
-        raise AIError("AI response schema_version must be 2")
+    _validate_schema_version(value)
     send_probability = _probability(
         value.get("send_probability"), "send_probability"
     )
