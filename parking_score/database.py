@@ -397,6 +397,33 @@ class Repository:
                 )
         return stable
 
+    def reconcile_remote_pairs(
+        self, pairs: Iterable[RemotePair], root: str, recursive: bool
+    ) -> int:
+        """Deactivate missing pairs only within a successfully listed scope."""
+        available = {(pair.image.path, pair.xml.path) for pair in pairs}
+        scope = PurePosixPath(root)
+        missing = []
+        for row in self.connection.execute(
+            "SELECT id, image_path, xml_path FROM observations"
+        ):
+            path = PurePosixPath(row["image_path"])
+            in_scope = scope in path.parents if recursive else path.parent == scope
+            if in_scope and (row["image_path"], row["xml_path"]) not in available:
+                missing.append((row["id"], row["image_path"]))
+        count = 0
+        with self.connection:
+            for observation_id, image_path in missing:
+                count += self.connection.execute(
+                    "UPDATE observations SET eligible=0, series_id=NULL "
+                    "WHERE id=? AND eligible=1", (observation_id,),
+                ).rowcount
+                # A returning identical pair must pass admission again.
+                self.connection.execute(
+                    "DELETE FROM pair_filters WHERE image_path=?", (image_path,)
+                )
+        return count
+
     def pair_filter_eligibility(self, pair: RemotePair) -> bool | None:
         row = self.connection.execute(
             """

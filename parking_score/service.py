@@ -125,6 +125,12 @@ class ParkingScoreService:
             logger.info("FTP listing complete files=%d", len(files))
             stable_counts = self.repository.update_remote_files(files)
             available_pairs = build_pairs(files, self.settings.image_extensions)
+            deactivated = self.repository.reconcile_remote_pairs(
+                available_pairs,
+                self.settings.ftp_root_dir,
+                self.settings.ftp_recursive,
+            )
+            logger.info("FTP reconciliation missing_pairs_deactivated=%d", deactivated)
             pairs = [
                 pair
                 for pair in available_pairs

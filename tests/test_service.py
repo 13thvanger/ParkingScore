@@ -8,6 +8,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Self
 
+import pytest
 from PIL import Image
 
 from parking_score.ai_client import AITransientError
@@ -120,6 +121,56 @@ def _xml() -> bytes:
   <Sign>1.01</Sign>
   <CameraSerialNumber>camera-1</CameraSerialNumber>
 </RecognitionData>"""
+
+
+@pytest.mark.parametrize("removed", ["xml", "jpg", "both"])
+def test_missing_pair_is_inactive_and_returns_without_losing_history(tmp_path, removed):
+    criteria = tmp_path / "criteria.txt"
+    criteria.write_text("[lawn]\ncriterion\n")
+    settings = Settings(
+        ftp_host="example", ftp_port=21, ftp_user="user", ftp_password="test",
+        ftp_root_dir="/root", ftp_stable_polls=1,
+        criteria_file=criteria, state_db=tmp_path / "state.db",
+        cache_dir=tmp_path / "cache",
+    )
+    ftp, ai = FakeFtp(_xml(), _jpeg()), FakeAI()
+    service = _service(settings, ftp, ai)
+    try:
+        service.run_cycle()
+        original = dict(ftp.source)
+        events = service.repository.connection.execute(
+            "SELECT COUNT(*) FROM assessment_events"
+        ).fetchone()[0]
+        if removed == "both":
+            ftp.source.clear()
+        else:
+            del ftp.source[f"/root/photo-1.{removed}"]
+        ftp.uploaded.clear()
+        service.run_cycle()
+        assert service.repository.connection.execute(
+            "SELECT eligible FROM observations"
+        ).fetchone()[0] == 0
+        assert not any(path.startswith("/root/") for path in ftp.uploaded)
+        assert ai.calls == 1
+        assert service.repository.connection.execute(
+            "SELECT COUNT(*) FROM assessment_events"
+        ).fetchone()[0] == events
+        ftp.source = original
+        service.run_cycle()
+        assert service.repository.connection.execute(
+            "SELECT eligible FROM observations"
+        ).fetchone()[0] == 1
+        assert ai.calls == 1
+        def broken_listing(*args):
+            raise OSError("incomplete listing")
+        ftp.list_files = broken_listing
+        with pytest.raises(OSError):
+            service.run_cycle()
+        assert service.repository.connection.execute(
+            "SELECT eligible FROM observations"
+        ).fetchone()[0] == 1
+    finally:
+        service.close()
 
 
 def test_cycle_processes_pair_and_finalizes_best(tmp_path) -> None:

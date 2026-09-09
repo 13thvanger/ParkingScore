@@ -207,6 +207,11 @@ class FtpClient:
                             facts["size"] = str(size)
                     except ftplib.Error:
                         pass
+                    if "size" not in facts:
+                        raise ValueError(
+                            "Incomplete FTP listing: cannot distinguish file "
+                            "from inaccessible directory"
+                        )
                     try:
                         response = ftp.sendcmd(f"MDTM {name}")
                         facts["modify"] = response.removeprefix("213 ").strip()
