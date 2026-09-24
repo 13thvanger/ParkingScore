@@ -320,7 +320,17 @@ class AIClient:
         for attempt in range(1, self.settings.ai_request_retries + 1):
             try:
                 self._wait_for_request_slot()
+                started = time.monotonic()
                 response = self.client.post(self.settings.ai_api_url, json=payload)
+                elapsed = time.monotonic() - started
+                try:
+                    diagnostic_body = response.json()
+                except ValueError:
+                    diagnostic_body = None
+                self._log_response_diagnostics(
+                    diagnostic_body, attempt, payload["max_tokens"],
+                    response.status_code, elapsed,
+                )
                 if response.status_code not in {200, 201}:
                     message = response.text[:500]
                     message_text = (
@@ -371,6 +381,41 @@ class AIClient:
                 )
                 time.sleep(delay)
         raise AITransientError(f"AI request failed after retries: {last_error}")
+
+    def _log_response_diagnostics(
+        self, body: Any, attempt: int, max_tokens: int,
+        http_status: int, elapsed: float,
+    ) -> None:
+        # Log only fixed field names, known reasons and nonnegative integer counts.
+        body = body if isinstance(body, dict) else {}
+        choices = body.get("choices")
+        choice = choices[0] if isinstance(choices, list) and choices else {}
+        choice = choice if isinstance(choice, dict) else {}
+        reason = choice.get("finish_reason")
+        if not isinstance(reason, str) or reason not in (
+            "stop", "length", "content_filter", "tool_calls", "function_call",
+        ):
+            reason = "missing" if reason is None else "unknown"
+        usage = body.get("usage")
+        usage = usage if isinstance(usage, dict) else {}
+        details = usage.get("completion_tokens_details")
+        details = details if isinstance(details, dict) else {}
+
+        def count(mapping: dict[str, Any], key: str) -> int | str:
+            value = mapping.get(key)
+            return value if type(value) is int and value >= 0 else "unavailable"
+
+        logger.info(
+            "AI response diagnostics attempt=%d/%d http_status=%d "
+            "duration_seconds=%.3f max_tokens=%d length_retry_max_tokens=%d "
+            "finish_reason=%s prompt_tokens=%s completion_tokens=%s "
+            "total_tokens=%s reasoning_tokens=%s",
+            attempt, self.settings.ai_request_retries, http_status, elapsed,
+            max_tokens,
+            max(self.settings.ai_max_tokens, self.settings.ai_length_retry_max_tokens),
+            reason, count(usage, "prompt_tokens"), count(usage, "completion_tokens"),
+            count(usage, "total_tokens"), count(details, "reasoning_tokens"),
+        )
 
     def _increase_token_limit_after_length(
         self, payload: dict[str, Any], error: Exception

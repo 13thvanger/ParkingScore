@@ -68,6 +68,51 @@ def _assess(client: AIClient):
     return client.assess(observation, _criteria(), image)
 
 
+def test_response_diagnostics_logs_usage_before_length_retry(caplog) -> None:
+    caplog.set_level("INFO", logger="parking_score.ai_client")
+    body = {
+        "choices": [{"finish_reason": "length", "message": {"content": None}}],
+        "usage": {
+            "prompt_tokens": 2500, "completion_tokens": 10000,
+            "total_tokens": 12500,
+            "completion_tokens_details": {"reasoning_tokens": 9990},
+        },
+    }
+    client = AIClient(
+        _settings(ai_request_retries=1, ai_max_tokens=10000,
+                  ai_length_retry_max_tokens=10000),
+        httpx.MockTransport(lambda request: httpx.Response(200, json=body)),
+    )
+    try:
+        with pytest.raises(AITransientError):
+            _assess(client)
+    finally:
+        client.close()
+    assert "max_tokens=10000 length_retry_max_tokens=10000" in caplog.text
+    assert "finish_reason=length prompt_tokens=2500 completion_tokens=10000" in caplog.text
+    assert "total_tokens=12500 reasoning_tokens=9990" in caplog.text
+    assert "duration_seconds=" in caplog.text
+
+
+@pytest.mark.parametrize("body", [None, [], {"choices": [None]}, {
+    "choices": [{"finish_reason": "PRIVATE_MARKER"}],
+    "usage": {"prompt_tokens": "PRIVATE_MARKER", "completion_tokens": True,
+              "total_tokens": -1,
+              "completion_tokens_details": {"reasoning_tokens": "PRIVATE_MARKER"}},
+    "PRIVATE_MARKER": "PRIVATE_MARKER",
+}])
+def test_response_diagnostics_omits_untrusted_values(caplog, body) -> None:
+    caplog.set_level("INFO", logger="parking_score.ai_client")
+    client = AIClient(_settings())
+    try:
+        client._log_response_diagnostics(body, 1, 1000, 200, 1.25)
+    finally:
+        client.close()
+    assert "PRIVATE_MARKER" not in caplog.text
+    assert "prompt_tokens=unavailable" in caplog.text
+    assert "reasoning_tokens=unavailable" in caplog.text
+
+
 def test_parse_assessment_accepts_fenced_v2_json() -> None:
     result = parse_assessment(f"```json\n{_response(82)}\n```", _criteria())
 
