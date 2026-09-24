@@ -113,6 +113,35 @@ def test_response_diagnostics_omits_untrusted_values(caplog, body) -> None:
     assert "reasoning_tokens=unavailable" in caplog.text
 
 
+@pytest.mark.parametrize(("value", "expected"), [
+    (True, True), (False, False), ("true", True), ("false", False),
+    (" TRUE ", True), (" False ", False),
+])
+def test_satisfied_normalization(value, expected):
+    response = json.loads(_response())
+    response["criteria"][0]["satisfied"] = value
+    result = parse_assessment(json.dumps(response), _criteria())
+    assert result.criteria_details[0]["satisfied"] is expected
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, [], {}, "PRIVATE_MARKER"])
+def test_satisfied_rejects_ambiguous_values_without_logging_content(value):
+    response = json.loads(_response())
+    response["criteria"][0]["satisfied"] = value
+    with pytest.raises(AIError) as error:
+        parse_assessment(json.dumps(response), _criteria())
+    assert "status=invalid" in str(error.value)
+    assert f"value_type={type(value).__name__}" in str(error.value)
+    assert "PRIVATE_MARKER" not in str(error.value)
+
+
+def test_missing_satisfied_is_not_false():
+    response = json.loads(_response())
+    del response["criteria"][0]["satisfied"]
+    with pytest.raises(AIError, match="status=missing"):
+        parse_assessment(json.dumps(response), _criteria())
+
+
 def test_parse_assessment_accepts_fenced_v2_json() -> None:
     result = parse_assessment(f"```json\n{_response(82)}\n```", _criteria())
 

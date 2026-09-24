@@ -165,9 +165,14 @@ def parse_assessment(content: str, criteria: CriteriaSet) -> Assessment:
             raise AIError(
                 f"AI response category mismatch for criterion {criterion_id}"
             )
-        if not isinstance(detail.get("satisfied"), bool):
+        satisfied = detail.get("satisfied")
+        if isinstance(satisfied, str) and satisfied.strip().lower() in {"true", "false"}:
+            satisfied = satisfied.strip().lower() == "true"
+        if not isinstance(satisfied, bool):
+            status = "missing" if "satisfied" not in detail else "invalid"
             raise AIError(
-                f"AI response satisfied must be boolean for {criterion_id}"
+                "AI response satisfied must be boolean or string true/false "
+                f"(status={status}, value_type={type(satisfied).__name__})"
             )
         evidence = detail.get("evidence")
         if not isinstance(evidence, str):
@@ -182,7 +187,7 @@ def parse_assessment(content: str, criteria: CriteriaSet) -> Assessment:
                     detail.get("probability"),
                     f"criteria[{criterion_id}].probability",
                 ),
-                "satisfied": detail["satisfied"],
+                "satisfied": satisfied,
                 "evidence": evidence,
             }
         )
