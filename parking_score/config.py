@@ -85,6 +85,8 @@ class Settings:
     ai_temperature: float = 0.0
     ai_max_tokens: int = 1000
     ai_length_retry_max_tokens: int = 4000
+    ai_debug_export_enabled: bool = False
+    ai_debug_export_ftp_dir: str = "/debug-ai"
     ai_image_max_dimension: int = 1920
     ai_image_jpeg_quality: int = 88
     ai_image_max_bytes: int = 5_000_000
@@ -180,6 +182,8 @@ class Settings:
             ai_temperature=_floating("AI_TEMPERATURE", 0.0),
             ai_max_tokens=ai_max_tokens,
             ai_length_retry_max_tokens=ai_length_retry_max_tokens,
+            ai_debug_export_enabled=_boolean("AI_DEBUG_EXPORT_ENABLED", False),
+            ai_debug_export_ftp_dir=os.getenv("AI_DEBUG_EXPORT_FTP_DIR", "/debug-ai").strip() or "/debug-ai",
             ai_image_max_dimension=_integer("AI_IMAGE_MAX_DIMENSION", 1920, 320),
             ai_image_jpeg_quality=quality,
             ai_image_max_bytes=_integer("AI_IMAGE_MAX_BYTES", 5_000_000, 100_000),

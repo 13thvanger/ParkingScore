@@ -108,7 +108,7 @@ class EvaluationRunner:
         self.settings = settings
         self.settings.ensure_runtime_dirs()
         self.repository = repository or Repository(settings.state_db)
-        self.ai_client = ai_client or AIClient(settings)
+        self.ai_client = ai_client or AIClient(replace(settings, ai_debug_export_enabled=False))
         self.ftp_factory = ftp_factory
 
     def close(self) -> None:

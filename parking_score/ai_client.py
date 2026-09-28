@@ -8,12 +8,14 @@ import time
 import uuid
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from pathlib import PurePosixPath
 from typing import Any
 
 import httpx
 
 from .config import Settings
 from .criteria import CriteriaSet
+from .ftp_client import FtpClient
 from .image_processor import PreparedImage
 from .models import Assessment, Observation
 
@@ -329,6 +331,7 @@ class AIClient:
         for attempt in range(1, self.settings.ai_request_retries + 1):
             request_id = uuid.uuid4().hex
             try:
+                self._export_debug_request(payload, request_id)
                 self._wait_for_request_slot()
                 started = time.monotonic()
                 response = self._post_with_diagnostics(
@@ -399,6 +402,26 @@ class AIClient:
             f"AI request failed after retries: {last_error} "
             f"request_id={request_id} operation_id={operation_id}"
         )
+
+    def _export_debug_request(self, payload: dict[str, Any], request_id: str) -> None:
+        if not self.settings.ai_debug_export_enabled:
+            return
+        try:
+            root = PurePosixPath(self.settings.ai_debug_export_ftp_dir)
+            if not root.is_absolute() or ".." in root.parts:
+                raise ValueError("Invalid debug directory")
+            directory = root / datetime.now(UTC).strftime("%Y-%m-%d")
+            path = str(directory / f"{request_id}.json")
+            content = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            with FtpClient(self.settings) as ftp:
+                ftp.ensure_directory(str(directory))
+                ftp.upload_atomic(path, content)
+            logger.info("AI debug request exported request_id=%s bytes=%d", request_id, len(content))
+        except Exception as exc:  # noqa: BLE001 - debug export must not block assessment
+            logger.warning(
+                "AI debug export failed request_id=%s error_type=%s",
+                request_id, type(exc).__name__,
+            )
 
     def _post_with_diagnostics(
         self, payload: dict[str, Any], operation_id: str,

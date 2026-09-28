@@ -201,6 +201,73 @@ def test_transport_success_logs_request_id_and_resets_active_count(caplog):
     assert "PRIVATE_MARKER" not in caplog.text
 
 
+@pytest.mark.parametrize("enabled,fail", [(False, False), (True, False), (True, True)])
+def test_debug_export_matches_request_and_is_optional(monkeypatch, caplog, enabled, fail):
+    exports = {}
+    connections = []
+
+    class DebugFtp:
+        def __init__(self, settings):
+            connections.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def ensure_directory(self, directory):
+            assert directory.startswith("/debug-ai/")
+
+        def upload_atomic(self, path, content):
+            if fail:
+                raise OSError("SECRET_MARKER")
+            exports[path] = content
+
+    monkeypatch.setattr("parking_score.ai_client.FtpClient", DebugFtp)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if enabled and not fail:
+            suffix = request.headers["X-Request-ID"] + ".json"
+            content = next(data for path, data in exports.items() if path.endswith(suffix))
+            assert json.loads(content) == json.loads(request.content)
+            assert b"SECRET_MARKER" not in content
+            assert b"Authorization" not in content
+        if len(calls) == 1:
+            return httpx.Response(200, json={"choices": [{
+                "finish_reason": "length", "message": {"content": None},
+            }]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": _response()}}]})
+
+    client = AIClient(_settings(ai_debug_export_enabled=enabled,
+                               ai_api_key="SECRET_MARKER", ftp_password="SECRET_MARKER"),
+                      httpx.MockTransport(handler))
+    try:
+        assert _assess(client).probability == 73
+    finally:
+        client.close()
+    assert len(connections) == (2 if enabled else 0)
+    assert len(exports) == (2 if enabled and not fail else 0)
+    if exports:
+        assert [json.loads(data)["max_tokens"] for data in exports.values()] == [1000, 2000]
+    assert "SECRET_MARKER" not in caplog.text
+
+
+def test_evaluation_disables_debug_export(tmp_path):
+    from parking_score.evaluation import EvaluationRunner
+
+    runner = EvaluationRunner(_settings(
+        ai_debug_export_enabled=True, state_db=tmp_path / "state.db",
+        cache_dir=tmp_path / "cache", evaluation_directory=tmp_path / "evaluation",
+    ))
+    try:
+        assert runner.ai_client.settings.ai_debug_export_enabled is False
+    finally:
+        runner.close()
+
+
 def test_parse_assessment_accepts_fenced_v2_json() -> None:
     result = parse_assessment(f"```json\n{_response(82)}\n```", _criteria())
 

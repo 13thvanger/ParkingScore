@@ -225,6 +225,21 @@ class FtpClient:
             ftp.cwd(current)
         return entries
 
+    def ensure_directory(self, directory: str) -> None:
+        ftp = self._connected()
+        current = "/"
+        for part in PurePosixPath(directory).parts:
+            if part == "/":
+                continue
+            current = posixpath.join(current, part)
+            try:
+                ftp.mkd(current)
+            except ftplib.error_perm:
+                # Verify it exists; do not ignore permission errors for missing paths.
+                previous = ftp.pwd()
+                ftp.cwd(current)
+                ftp.cwd(previous)
+
     def download_to(self, remote_path: str, local_path: Path) -> None:
         ftp = self._connected()
         local_path.parent.mkdir(parents=True, exist_ok=True)
