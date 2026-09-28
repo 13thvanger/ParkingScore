@@ -5,6 +5,7 @@ import logging
 import random
 import threading
 import time
+import uuid
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -296,6 +297,8 @@ class AIClient:
     ) -> None:
         self.settings = settings
         self._request_gate_lock = threading.Lock()
+        self._active_lock = threading.Lock()
+        self._active_requests = 0
         self._next_request_at = 0.0
         self._cooldown_until = 0.0
         self.client = httpx.Client(
@@ -322,11 +325,15 @@ class AIClient:
     ) -> Assessment:
         payload = self._payload(observation, criteria, image)
         last_error: Exception | None = None
+        operation_id = uuid.uuid4().hex
         for attempt in range(1, self.settings.ai_request_retries + 1):
+            request_id = uuid.uuid4().hex
             try:
                 self._wait_for_request_slot()
                 started = time.monotonic()
-                response = self.client.post(self.settings.ai_api_url, json=payload)
+                response = self._post_with_diagnostics(
+                    payload, operation_id, request_id, attempt
+                )
                 elapsed = time.monotonic() - started
                 try:
                     diagnostic_body = response.json()
@@ -335,11 +342,11 @@ class AIClient:
                 self._log_response_diagnostics(
                     diagnostic_body, attempt, payload["max_tokens"],
                     response.status_code, elapsed,
+                    request_id=request_id,
                 )
                 if response.status_code not in {200, 201}:
-                    message = response.text[:500]
                     message_text = (
-                        f"AI API returned HTTP {response.status_code}: {message}"
+                        f"AI API returned HTTP {response.status_code} request_id={request_id}"
                     )
                     if (
                         response.status_code not in {403, 408, 409, 429}
@@ -373,7 +380,8 @@ class AIClient:
                 if isinstance(exc, _RetryableAIError) and exc.global_cooldown:
                     self._extend_global_cooldown(delay)
                 logger.warning(
-                    "AI request attempt %d/%d failed; retrying in %.1fs%s: %s",
+                    "AI request attempt %d/%d failed; retrying in %.1fs%s: %s "
+                    "request_id=%s operation_id=%s",
                     attempt,
                     self.settings.ai_request_retries,
                     delay,
@@ -383,13 +391,84 @@ class AIClient:
                         else ""
                     ),
                     exc,
+                    request_id,
+                    operation_id,
                 )
                 time.sleep(delay)
-        raise AITransientError(f"AI request failed after retries: {last_error}")
+        raise AITransientError(
+            f"AI request failed after retries: {last_error} "
+            f"request_id={request_id} operation_id={operation_id}"
+        )
+
+    def _post_with_diagnostics(
+        self, payload: dict[str, Any], operation_id: str,
+        request_id: str, attempt: int,
+    ) -> httpx.Response:
+        started = time.monotonic()
+        stage_started = started
+        stage = "transport_wait"
+        stages = {
+            "connect_tcp", "start_tls", "send_request_headers",
+            "send_request_body", "receive_response_headers", "receive_response_body",
+        }
+
+        def trace(event: str, info: dict[str, Any]) -> None:
+            nonlocal stage, stage_started
+            parts = event.split(".")
+            if len(parts) != 3 or parts[1] not in stages:
+                return
+            if parts[2] == "started":
+                stage, stage_started = parts[1], time.monotonic()
+            elif parts[2] == "complete" and stage == parts[1]:
+                logger.info(
+                    "AI transport stage request_id=%s stage=%s duration_seconds=%.3f",
+                    request_id, stage, time.monotonic() - stage_started,
+                )
+
+        with self._active_lock:
+            self._active_requests += 1
+            active = self._active_requests
+        logger.info(
+            "AI request started request_id=%s operation_id=%s attempt=%d/%d "
+            "max_tokens=%d timeout_seconds=%s active_requests=%d",
+            request_id, operation_id, attempt, self.settings.ai_request_retries,
+            payload["max_tokens"], self.settings.ai_timeout_seconds, active,
+        )
+        try:
+            response = self.client.post(
+                self.settings.ai_api_url, json=payload,
+                headers={"X-Request-ID": request_id}, extensions={"trace": trace},
+            )
+            logger.info(
+                "AI request completed request_id=%s operation_id=%s "
+                "http_status=%d duration_seconds=%.3f",
+                request_id, operation_id, response.status_code, time.monotonic() - started,
+            )
+            return response
+        except httpx.HTTPError as exc:
+            with self._active_lock:
+                active = self._active_requests
+            error_stage = "pool_wait" if isinstance(exc, httpx.PoolTimeout) else stage
+            logger.warning(
+                "AI transport failed request_id=%s operation_id=%s attempt=%d/%d "
+                "error_type=%s stage=%s duration_seconds=%.3f "
+                "stage_duration_seconds=%.3f timeout_seconds=%s active_requests=%d",
+                request_id, operation_id, attempt, self.settings.ai_request_retries,
+                type(exc).__name__, error_stage, time.monotonic() - started,
+                time.monotonic() - stage_started, self.settings.ai_timeout_seconds, active,
+            )
+            # Do not copy transport exception messages (URLs/headers may contain secrets).
+            raise type(exc)(
+                f"AI transport {type(exc).__name__} request_id={request_id}"
+            ) from None
+        finally:
+            with self._active_lock:
+                self._active_requests -= 1
 
     def _log_response_diagnostics(
         self, body: Any, attempt: int, max_tokens: int,
         http_status: int, elapsed: float,
+        request_id: str = "unavailable",
     ) -> None:
         # Log only fixed field names, known reasons and nonnegative integer counts.
         body = body if isinstance(body, dict) else {}
@@ -414,12 +493,12 @@ class AIClient:
             "AI response diagnostics attempt=%d/%d http_status=%d "
             "duration_seconds=%.3f max_tokens=%d length_retry_max_tokens=%d "
             "finish_reason=%s prompt_tokens=%s completion_tokens=%s "
-            "total_tokens=%s reasoning_tokens=%s",
+            "total_tokens=%s reasoning_tokens=%s request_id=%s",
             attempt, self.settings.ai_request_retries, http_status, elapsed,
             max_tokens,
             max(self.settings.ai_max_tokens, self.settings.ai_length_retry_max_tokens),
             reason, count(usage, "prompt_tokens"), count(usage, "completion_tokens"),
-            count(usage, "total_tokens"), count(details, "reasoning_tokens"),
+            count(usage, "total_tokens"), count(details, "reasoning_tokens"), request_id,
         )
 
     def _increase_token_limit_after_length(

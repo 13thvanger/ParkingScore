@@ -142,6 +142,65 @@ def test_missing_satisfied_is_not_false():
         parse_assessment(json.dumps(response), _criteria())
 
 
+@pytest.mark.parametrize(("error", "stage"), [
+    (httpx.ReadTimeout, "receive_response_headers"),
+    (httpx.ReadTimeout, "receive_response_body"),
+    (httpx.ConnectTimeout, "connect_tcp"),
+    (httpx.WriteTimeout, "send_request_body"),
+    (httpx.PoolTimeout, "pool_wait"),
+])
+def test_transport_failure_correlation_and_safe_logs(caplog, error, stage):
+    caplog.set_level("INFO", logger="parking_score.ai_client")
+    ids = []
+
+    def handler(request):
+        ids.append(request.headers["X-Request-ID"])
+        if stage != "pool_wait":
+            request.extensions["trace"](
+                f"http11.{stage}.started", {"secret": "PRIVATE_MARKER"}
+            )
+        raise error("PRIVATE_MARKER")
+
+    client = AIClient(_settings(ai_request_retries=2), httpx.MockTransport(handler))
+    try:
+        with pytest.raises(AITransientError) as caught:
+            _assess(client)
+        assert client._active_requests == 0
+        assert len(set(ids)) == 2
+        assert ids[-1] in str(caught.value)
+    finally:
+        client.close()
+    failures = [r.message for r in caplog.records if "AI transport failed" in r.message]
+    assert len(failures) == 2
+    assert all(f"stage={stage}" in line for line in failures)
+    assert all("active_requests=1" in line for line in failures)
+    operations = {line.split("operation_id=")[1].split()[0] for line in failures}
+    assert len(operations) == 1
+    assert "PRIVATE_MARKER" not in caplog.text + str(caught.value)
+
+
+def test_transport_success_logs_request_id_and_resets_active_count(caplog):
+    caplog.set_level("INFO", logger="parking_score.ai_client")
+    ids = []
+
+    def handler(request):
+        ids.append(request.headers["X-Request-ID"])
+        trace = request.extensions["trace"]
+        trace("http11.receive_response_headers.started", {})
+        trace("http11.receive_response_headers.complete", {"secret": "PRIVATE_MARKER"})
+        return httpx.Response(200, json={"choices": [{"message": {"content": _response()}}]})
+
+    client = AIClient(_settings(), httpx.MockTransport(handler))
+    try:
+        assert _assess(client).probability == 73
+        assert client._active_requests == 0
+    finally:
+        client.close()
+    for name in ("AI request started", "AI request completed", "AI response diagnostics"):
+        assert any(name in r.message and ids[0] in r.message for r in caplog.records)
+    assert "PRIVATE_MARKER" not in caplog.text
+
+
 def test_parse_assessment_accepts_fenced_v2_json() -> None:
     result = parse_assessment(f"```json\n{_response(82)}\n```", _criteria())
 
