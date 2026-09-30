@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
 
+import httpx
+import pytest
 from PIL import Image
 
 from parking_score.config import Settings
@@ -38,6 +40,13 @@ class FakeAI:
 
     def close(self) -> None:
         return None
+
+    def _wait_for_request_slot(self):
+        pass
+
+    def _post_with_diagnostics(self, payload, *args):
+        return httpx.Response(200, json={'choices':[{'finish_reason':'stop',
+            'message':{'content':'{"plate":"O716MP49","readable":true,"confidence":95}'}}]})
 
 
 class FakeFtp:
@@ -74,7 +83,8 @@ def _xml() -> bytes:
 <SerialNumber>equipment-1</SerialNumber>
 <CaptureInfo><Id>capture-1</Id><Date>2026-08-01T10:00:00Z</Date>
 <Number>O716MP48</Number></CaptureInfo>
-<ImagesInfo><ImageWidth>320</ImageWidth><ImageHeight>200</ImageHeight></ImagesInfo>
+<ImagesInfo><ImageWidth>320</ImageWidth><ImageHeight>200</ImageHeight>
+<Position><X1>100</X1><Y1>100</Y1><X2>150</X2><Y2>120</Y2></Position></ImagesInfo>
 <Address>test</Address><Sign>1.01</Sign></RecognitionData>"""
 
 
@@ -89,13 +99,15 @@ def _criteria() -> CriteriaSet:
     )
 
 
-def test_evaluate_is_resumable_and_does_not_change_live_state(tmp_path) -> None:
+@pytest.mark.parametrize('ocr_enabled', [False, True])
+def test_evaluate_is_resumable_and_does_not_change_live_state(tmp_path, ocr_enabled) -> None:
     settings = Settings(
         ftp_host="example",
         ftp_port=21,
         ftp_user="user",
         ftp_password="not-real",
         ai_api_key="not-real",
+        plate_ocr_enabled=ocr_enabled,
         state_db=tmp_path / "state.db",
         cache_dir=tmp_path / "cache",
         evaluation_directory=tmp_path / "evaluation",
@@ -168,5 +180,7 @@ def test_evaluate_is_resumable_and_does_not_change_live_state(tmp_path) -> None:
         result = json.loads(output.read_text(encoding="utf-8"))
         assert result["status"] == "completed"
         assert result["assessment"]["send_probability"] == 88
+        if ocr_enabled:
+            assert result['assessment']['plate_check']['plate_check_status'] == 'mismatch'
     finally:
         runner.close()

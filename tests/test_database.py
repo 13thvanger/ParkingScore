@@ -44,6 +44,32 @@ def _assessment(probability: int) -> Assessment:
     return Assessment(probability, [], "", "{}")
 
 
+def test_plate_history_survives_reopen_and_retry_is_idempotent(tmp_path):
+    from dataclasses import replace
+    path = tmp_path / 'ocr.db'
+    now = datetime(2026, 8, 1, tzinfo=UTC)
+    repository = Repository(path)
+    observation_id = _add(repository, 'ocr', now, now)
+    repository.rebuild_series(15)
+    plate_check = {'plate_check_status':'mismatch', 'plate_recognized':'O716MP49',
+                   'plate_recognition_confidence':95}
+    score = replace(_assessment(75), plate_check=plate_check)
+    assessment_id = repository.save_assessment(observation_id, 'hash', score)
+    repository.close()
+    repository = Repository(path)
+    try:
+        repository.save_assessment(observation_id, 'hash', _assessment(1),
+                                   assessment_id=assessment_id)
+        events, _ = repository.export_assessments()
+        assert len(events) == 1
+        assert events[0]['plate_check'] == plate_check
+        assert events[0]['send_probability'] == 75
+        txt = repository.output_updates('hash', 15, now=now+timedelta(hours=1))[0].content
+        assert 'plate_recognized=O716MP49\n' in txt
+    finally:
+        repository.close()
+
+
 def test_production_v1_database_migrates_to_contract_free_v2(tmp_path) -> None:
     database = tmp_path / "v1.db"
     connection = sqlite3.connect(database)

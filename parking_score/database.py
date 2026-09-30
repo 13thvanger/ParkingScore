@@ -231,6 +231,7 @@ class Repository:
             for row in self.connection.execute("PRAGMA table_info(assessment_events)")
         }
         assessment_event_columns = {
+            "plate_check_json": "TEXT",
             "assessment_id": "TEXT",
             "source_key": "TEXT",
             "capture_id": "TEXT",
@@ -894,10 +895,10 @@ class Repository:
                     criteria_hash, criteria_version, criteria_snapshot_json,
                     model_name, prompt_version, model_parameters_json,
                     criteria_details_json, comment, raw_response, series_id,
-                    best, source, mode, image_sha256, evaluation_run_id
+                    best, source, mode, image_sha256, evaluation_run_id, plate_check_json
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, 0, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -930,6 +931,7 @@ class Repository:
                     mode,
                     image_sha256,
                     evaluation_run_id,
+                    json.dumps(assessment.plate_check, ensure_ascii=False) if assessment.plate_check else None,
                 ),
             )
             if mode == "live":
@@ -1044,9 +1046,10 @@ class Repository:
         now = now or utc_now()
         rows = self.connection.execute(
             """
-            SELECT * FROM observations
-            WHERE eligible=1 AND series_id IS NOT NULL
-            ORDER BY series_id, captured_at, source_key
+            SELECT o.*, e.plate_check_json FROM observations o
+            LEFT JOIN assessment_events e ON e.assessment_id=o.assessment_id
+            WHERE o.eligible=1 AND o.series_id IS NOT NULL
+            ORDER BY o.series_id, o.captured_at, o.source_key
             """
         ).fetchall()
         by_series: dict[str, list[sqlite3.Row]] = defaultdict(list)
@@ -1134,6 +1137,13 @@ class Repository:
                     f"model={row['model_name']}\n"
                     f"prompt_version={row['prompt_version']}\n"
                 )
+                if row["plate_check_json"]:
+                    plate_check = json.loads(row["plate_check_json"])
+                    content += f"plate_check_status={plate_check['plate_check_status']}\n"
+                    if plate_check.get("plate_recognized"):
+                        content += f"plate_recognized={plate_check['plate_recognized']}\n"
+                    if plate_check.get("plate_recognition_confidence") is not None:
+                        content += f"plate_recognition_confidence={plate_check['plate_recognition_confidence']}\n"
                 if content == row["published_content"]:
                     continue
                 directory = row["directory"]
@@ -1375,6 +1385,7 @@ class Repository:
             (after_id, limit),
         ).fetchall()
         json_columns = {
+            "plate_check_json": "plate_check",
             "criteria_snapshot_json": "criteria_snapshot",
             "model_parameters_json": "model_parameters",
             "criteria_details_json": "criteria_details",

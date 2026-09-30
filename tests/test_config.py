@@ -10,6 +10,18 @@ def _required_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AI_API_KEY", "test-key")
 
 
+def test_plate_ocr_config(monkeypatch):
+    _required_environment(monkeypatch)
+    monkeypatch.setenv("PLATE_OCR_ENABLED", "true")
+    monkeypatch.setenv("PLATE_OCR_CONFIDENCE_THRESHOLD", "95")
+    settings = Settings.from_env(None)
+    assert settings.plate_ocr_enabled
+    assert settings.plate_ocr_confidence_threshold == 95
+    monkeypatch.setenv("PLATE_OCR_CONFIDENCE_THRESHOLD", "101")
+    with pytest.raises(ConfigurationError):
+        Settings.from_env(None)
+
+
 def test_length_retry_limit_is_loaded_from_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

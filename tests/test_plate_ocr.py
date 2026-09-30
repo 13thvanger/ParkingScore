@@ -58,3 +58,64 @@ def test_invalid_crop_fails_before_ai(tmp_path):
     metadata = parse_recognition_xml(SAMPLE_XML)
     with pytest.raises(ValueError, match="aspect ratio"):
         prepare_plate_crop(image, metadata)
+
+
+def test_unreadable_without_confidence():
+    result = compare_ocr('{"readable":false,"plate":null}', 'O716MP48', 90)
+    assert result['plate_check_status'] == 'uncertain'
+    assert result['plate_recognized'] is None
+
+
+@pytest.mark.parametrize('confidence', [None, True, -1, 101, '95'])
+def test_readable_requires_valid_confidence(confidence):
+    from parking_score.ai_client import AIError
+    with pytest.raises(AIError):
+        compare_ocr(json.dumps({'plate':'O716MP48','readable':True,
+                               'confidence':confidence}), 'O716MP48', 90)
+
+
+@pytest.mark.parametrize('case,status', [
+    ('ok','mismatch'), ('timeout','error'), ('http','error'),
+    ('length','error'), ('no_box','unavailable'), ('unreadable','uncertain'),
+])
+def test_enrichment_is_independent_and_safe(tmp_path, monkeypatch, case, status):
+    from types import SimpleNamespace
+
+    from parking_score.ai_client import AIClient
+    from parking_score.models import Assessment
+    from parking_score.plate_ocr import enrich_assessment
+    metadata = parse_recognition_xml(SAMPLE_XML)
+    image = tmp_path / 'input.jpg'
+    Image.new('RGB', (1920,1200)).save(image)
+    observation = SimpleNamespace(cache_image_path=image, plate=metadata.plate,
+        plate_box=None if case == 'no_box' else metadata.plate_box,
+        image_width=1920, image_height=1200)
+    settings = Settings(ftp_host='unused',ftp_port=21,ftp_user='unused',
+        ftp_password='unused',ai_api_key='test',plate_ocr_enabled=True,
+        ai_debug_export_enabled=True)
+    calls = []
+    def forbidden(*args, **kwargs):
+        raise AssertionError('FTP forbidden')
+    monkeypatch.setattr('parking_score.ai_client.FtpClient', forbidden)
+    def handler(request):
+        calls.append(request)
+        assert metadata.plate not in request.content.decode()
+        if case == 'timeout':
+            raise httpx.ReadTimeout('secret diagnostic must not be logged')
+        content = {'plate':'O716MP49','readable':True,'confidence':95}
+        if case == 'unreadable':
+            content = {'plate':None,'readable':False}
+        return httpx.Response(429 if case == 'http' else 200, json={'choices':[
+            {'finish_reason':'length' if case == 'length' else 'stop',
+             'message':{'content':json.dumps(content)}}]})
+    client = AIClient(settings, httpx.MockTransport(handler))
+    slots = []
+    monkeypatch.setattr(client, '_wait_for_request_slot', lambda: slots.append(True))
+    score = Assessment(75, [], '', '{}')
+    try:
+        result = enrich_assessment(client, settings, observation, score)
+    finally:
+        client.close()
+    assert result.probability == 75
+    assert result.plate_check['plate_check_status'] == status
+    assert len(calls) == len(slots) == (0 if case == 'no_box' else 1)

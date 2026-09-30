@@ -17,6 +17,7 @@ from .database import Repository, to_iso, utc_now
 from .ftp_client import FtpClient, build_pairs
 from .image_processor import ImageDecodeError, PreparedImage, prepare_image
 from .models import Assessment, Observation
+from .plate_ocr import enrich_assessment
 from .xml_parser import (
     ELIGIBLE_SIGN_CODES,
     extract_sign,
@@ -352,6 +353,7 @@ class ParkingScoreService:
             observation.cache_image_path.read_bytes()
         ).hexdigest()
         assessment = self.ai_client.assess(observation, criteria, prepared)
+        assessment = enrich_assessment(self.ai_client, self.settings, observation, assessment)
         return assessment, image_sha256
 
     def _prepare_cached_image(self, observation: Observation) -> PreparedImage:

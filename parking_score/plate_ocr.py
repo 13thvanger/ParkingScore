@@ -1,4 +1,4 @@
-"""One-shot plate OCR experiment. Local inputs/output; never publishes to FTP."""
+"""Independent plate OCR enrichment and local no-publish trial CLI."""
 from __future__ import annotations
 
 import argparse
@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import re
+import time
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -16,6 +17,7 @@ from PIL import Image
 
 from .ai_client import AIClient, AIError, _extract_json_object, _message_text
 from .config import Settings
+from .models import Assessment, Observation
 from .xml_parser import normalize_plate, parse_recognition_xml
 
 
@@ -83,6 +85,8 @@ def compare_ocr(content: str, expected: str, threshold: int) -> dict:
     )
     if type(readable) is not bool:
         raise AIError("OCR readable must be boolean")
+    if not readable and confidence is None:
+        confidence = 0
     if type(confidence) not in (int, float) or not 0 <= confidence <= 100:
         raise AIError("OCR confidence must be a number in 0..100")
     if plate is not None and not isinstance(plate, str):
@@ -101,6 +105,54 @@ def compare_ocr(content: str, expected: str, threshold: int) -> dict:
         "plate_recognition_confidence": confidence,
         "confidence_threshold": threshold,
     }
+
+
+def enrich_assessment(client: AIClient, settings: Settings, observation: Observation,
+                      assessment: Assessment) -> Assessment:
+    """Optional independent OCR; failures never invalidate the parking score.
+
+    Uses the scoring client's shared limiter and transport, with one attempt per
+    assessment. No debug FTP export, original plate in prompt, or full-frame fallback.
+    """
+    if not settings.plate_ocr_enabled:
+        return assessment
+    request_id = uuid.uuid4().hex
+    result = {
+        "plate_check_status": "error", "request_id": request_id,
+        "model": settings.ai_model, "prompt_version": "plate-ocr-v1",
+        "confidence_threshold": settings.plate_ocr_confidence_threshold,
+    }
+    started = time.monotonic()
+    try:
+        try:
+            crop = prepare_plate_crop(observation.cache_image_path, observation)
+        except (ValueError, OSError):
+            result["plate_check_status"] = "unavailable"
+            return replace(assessment, plate_check=result)
+        client._wait_for_request_slot()
+        response = client._post_with_diagnostics(
+            ocr_payload(settings, crop), request_id, request_id, 1
+        )
+        result["http_status"] = response.status_code
+        if response.status_code != 200:
+            raise AIError("OCR HTTP error")
+        body = response.json()
+        if body.get("choices", [{}])[0].get("finish_reason") != "stop":
+            raise AIError("OCR response not complete")
+        result.update(compare_ocr(
+            _message_text(body), observation.plate,
+            settings.plate_ocr_confidence_threshold,
+        ))
+    except Exception as exc:  # noqa: BLE001 - OCR is auxiliary, not a scoring failure
+        result["error_type"] = type(exc).__name__
+    finally:
+        logging.getLogger(__name__).info(
+            "Plate OCR completed request_id=%s status=%s duration_seconds=%.3f "
+            "http_status=%s error_type=%s",
+            request_id, result["plate_check_status"], time.monotonic() - started,
+            result.get("http_status"), result.get("error_type"),
+        )
+    return replace(assessment, plate_check=result)
 
 
 def run_trial(settings: Settings, image: Path, xml: Path, threshold: int = 90,

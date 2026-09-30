@@ -115,6 +115,7 @@ class Assessment:
     evidence_quality_probability: int | None = None
     target_identity_probability: int | None = None
     schema_version: int = 2
+    plate_check: dict[str, Any] | None = None
 
     @property
     def probability(self) -> int:

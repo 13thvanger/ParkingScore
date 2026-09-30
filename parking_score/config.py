@@ -90,6 +90,8 @@ class Settings:
     ai_image_max_dimension: int = 1920
     ai_image_jpeg_quality: int = 88
     ai_image_max_bytes: int = 5_000_000
+    plate_ocr_enabled: bool = False
+    plate_ocr_confidence_threshold: int = 90
 
     criteria_file: Path = Path("criteria.txt")
     state_db: Path = Path("data/parking_score.db")
@@ -117,6 +119,9 @@ class Settings:
         if not extensions:
             raise ConfigurationError("IMAGE_EXTENSIONS cannot be empty")
 
+        plate_threshold = _integer("PLATE_OCR_CONFIDENCE_THRESHOLD", 90, 0)
+        if plate_threshold > 100:
+            raise ConfigurationError("PLATE_OCR_CONFIDENCE_THRESHOLD must be <= 100")
         quality = _integer("AI_IMAGE_JPEG_QUALITY", 88)
         if quality > 95:
             raise ConfigurationError("AI_IMAGE_JPEG_QUALITY must be <= 95")
@@ -187,6 +192,8 @@ class Settings:
             ai_image_max_dimension=_integer("AI_IMAGE_MAX_DIMENSION", 1920, 320),
             ai_image_jpeg_quality=quality,
             ai_image_max_bytes=_integer("AI_IMAGE_MAX_BYTES", 5_000_000, 100_000),
+            plate_ocr_enabled=_boolean("PLATE_OCR_ENABLED", False),
+            plate_ocr_confidence_threshold=plate_threshold,
             criteria_file=Path(os.getenv("CRITERIA_FILE", "criteria.txt")).expanduser(),
             state_db=Path(os.getenv("STATE_DB", "data/parking_score.db")).expanduser(),
             cache_dir=Path(os.getenv("CACHE_DIR", "data/cache")).expanduser(),

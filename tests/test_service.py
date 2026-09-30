@@ -65,6 +65,46 @@ class FakeAI:
         return None
 
 
+@pytest.mark.parametrize('http_status', [200, 429])
+def test_plate_ocr_persists_and_publishes_without_changing_identity(tmp_path, http_status):
+    import json
+
+    import httpx
+    criteria = tmp_path / 'criteria.txt'
+    criteria.write_text('[lawn]\ncriterion\n')
+    settings = Settings(ftp_host='unused',ftp_port=21,ftp_user='unused',
+        ftp_password='unused',ftp_stable_polls=1,criteria_file=criteria,
+        cache_dir=tmp_path/'cache',state_db=tmp_path/'state.db',plate_ocr_enabled=True)
+    class OCRFakeAI(FakeAI):
+        def _wait_for_request_slot(self):
+            pass
+        def _post_with_diagnostics(self, payload, *args):
+            assert 'O716MP48' not in json.dumps(payload)
+            return httpx.Response(http_status,json={'choices':[{'finish_reason':'stop',
+                'message':{'content':'{"plate":"O716MP49","readable":true,"confidence":95}'}}]})
+    ftp, ai = FakeFtp(_xml(),_jpeg()), OCRFakeAI()
+    service = _service(settings,ftp,ai)
+    try:
+        service.run_cycle()
+        txt = ftp.uploaded['/root/photo-1.txt'].decode()
+        assert txt.startswith('probability=73\nbest=false\n')
+        status = 'mismatch' if http_status == 200 else 'error'
+        assert f'plate_check_status={status}\n' in txt
+        if http_status == 200:
+            assert 'plate_recognized=O716MP49\n' in txt
+        else:
+            assert 'plate_recognized=' not in txt
+        events, _ = service.repository.export_assessments()
+        assert events[0]['plate_check']['plate_check_status'] == status
+        row = service.repository.connection.execute('SELECT plate, assessment_id FROM observations').fetchone()
+        assert row['plate'] == 'O716MP48'
+        service.run_cycle()
+        assert ai.calls == 1
+        assert len(service.repository.export_assessments()[0]) == 1
+    finally:
+        service.close()
+
+
 def _service(settings, fake_ftp, fake_ai):
     return ParkingScoreService(
         settings,

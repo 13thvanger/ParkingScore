@@ -12,6 +12,7 @@ from .criteria import CriteriaSet
 from .database import Repository, utc_now
 from .ftp_client import FtpClient
 from .image_processor import prepare_image
+from .plate_ocr import enrich_assessment
 from .xml_parser import parse_recognition_xml
 
 
@@ -167,6 +168,9 @@ class EvaluationRunner:
                 )
                 assessment = self.ai_client.assess(
                     evaluation_observation, criteria, prepared
+                )
+                assessment = enrich_assessment(
+                    self.ai_client, self.settings, evaluation_observation, assessment
                 )
                 parameters = getattr(
                     self.ai_client,
